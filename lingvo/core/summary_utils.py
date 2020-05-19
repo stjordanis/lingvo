@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,13 +19,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
-
-import tensorflow as tf
-
+import time
+import lingvo.compat as tf
 from lingvo.core import cluster_factory
 from lingvo.core import plot
 from lingvo.core import py_utils
+import numpy as np
 
 
 def _ShouldAddSummary():
@@ -41,6 +41,11 @@ def histogram(*args, **kwargs):  # pylint: disable=invalid-name
     tf.summary.histogram(*args, **kwargs)
 
 
+def image(*args, **kwargs):  # pylint: disable=invalid-name
+  if _ShouldAddSummary():
+    tf.summary.image(*args, **kwargs)
+
+
 def SequenceLength(padding):
   """Computes the length of a sequence based on binary padding.
 
@@ -51,7 +56,7 @@ def SequenceLength(padding):
     seq_lens, A tensor of shape [batch] containing the non-padded length of each
       element of plot_tensor along the batch dimension.
   """
-  seq_lens = tf.cast(tf.reduce_sum(1 - padding, axis=1), tf.int32)
+  seq_lens = tf.cast(tf.round(tf.reduce_sum(1 - padding, axis=1)), tf.int32)
   # Get rid of any extra dimensions.
   batch_size = tf.shape(padding)[0]
   seq_lens = tf.reshape(seq_lens, [batch_size], name='seq_lens')
@@ -101,51 +106,115 @@ def TrimPaddingAndPlotAttention(fig,
     axes.set_xlabel(plot.ToUnicode(transcript), size='x-small', wrap=True)
 
 
-def AddAttentionSummary(attention_tensors,
+def AddAttentionSummary(name,
+                        attention_tensors,
                         src_paddings,
                         tgt_paddings,
                         transcripts=None,
                         max_outputs=3):
   """Adds an image summary showing the attention probability matrix and state.
 
+  Tensors are in sequence tensor format with the batch dimension in axis 1.
+
   Args:
+    name: Summary name.
     attention_tensors: A list of 3D tensors shaped [target_len, batch_size,
-       source_len] where attention[i, j, k] is the probability for the i-th
-       output attending to the k-th input for element j in the batch.
+      source_len] where attention[i, j, k] is the probability for the i-th
+      output attending to the k-th input for element j in the batch.
     src_paddings: A tensor of binary paddings shaped [source_len, batch] for the
-      source sequence.
+      source sequence. Or a list of tensors of the same length as
+      attention_tensors with a separate paddings for each entry in
+      attention_tensors.
     tgt_paddings: A tensor of binary paddings shaped [target_len, batch] for the
-      target sequence.
-    transcripts: Optional, transcripts shaped [batch, target_len] for the source
+      target sequence. Or a list of tensors of the same length as
+      attention_tensors with a separate paddings for each entry in
+      attention_tensors.
+    transcripts: Optional, transcripts shaped [batch, source_len] for the source
       sequence.
     max_outputs: Integer maximum number of elements of the batch to plot.
-
-  Returns:
-    The added image summary.
   """
-  name = attention_tensors[0].name + '/Attention'
+
+  def Transpose(paddings):
+    paddings = paddings if isinstance(paddings, list) else [paddings]
+    return [tf.transpose(p) for p in paddings]
+
+  AddAttentionSummaryBatchMajor(
+      name, [tf.transpose(a, [1, 0, 2]) for a in attention_tensors],
+      Transpose(src_paddings), Transpose(tgt_paddings), transcripts,
+      max_outputs)
+
+
+def AddAttentionSummaryBatchMajor(name,
+                                  attention_tensors,
+                                  src_paddings,
+                                  tgt_paddings,
+                                  transcripts=None,
+                                  max_outputs=3):
+  """Adds an image summary showing the attention probability matrix and state.
+
+  As opposed to AddAttentionSummary() takes all tensors with batch dimension in
+  axis 0.
+
+  Args:
+    name: Summary name.
+    attention_tensors: A list of 3D tensors shaped [batch_size, target_len,
+      source_len] where attention[b, i, j] is the probability for the i-th
+      output attending to the j-th input for element b in the batch.
+    src_paddings: A tensor of binary paddings shaped [batch, source_len] for the
+      source sequence. Or a list of tensors of the same length as
+      attention_tensors with a separate paddings for each entry in
+      attention_tensors.
+    tgt_paddings: A tensor of binary paddings shaped [batch, target_len] for the
+      target sequence. Or a list of tensors of the same length as
+      attention_tensors with a separate paddings for each entry in
+      attention_tensors.
+    transcripts: Optional, transcripts shaped [batch, source_len] for the source
+      sequence.
+    max_outputs: Integer maximum number of elements of the batch to plot.
+  """
+
+  def VerifyLen(paddings):
+    length = len(paddings) if isinstance(paddings, list) else 1
+    if length != 1 and length != len(attention_tensors):
+      raise ValueError('Bad length of paddings list {}'.format(length))
+
+  VerifyLen(src_paddings)
+  VerifyLen(tgt_paddings)
+
   if not _ShouldAddSummary():
-    return tf.summary.scalar('disabled_%s' % name, 0)
-  fig = plot.MatplotlibFigureSummary(name, max_outputs=max_outputs)
-  src_lens = SequenceLength(tf.transpose(src_paddings))
-  tgt_lens = SequenceLength(tf.transpose(tgt_paddings))
-  for n, atten in enumerate(attention_tensors):
-    # Diagnostic metric that decreases as attention picks up.
-    max_entropy = tf.log(tf.cast(src_lens, tf.float32))
-    max_entropy = tf.expand_dims(tf.expand_dims(max_entropy, 0), -1)
-    atten_normalized_entropy = -atten * tf.log(atten + 1e-10) / max_entropy
-    scalar('Attention/average_normalized_entropy/%d' % n,
-           tf.reduce_mean(atten_normalized_entropy))
-    args = [tf.transpose(atten, [1, 0, 2]), src_lens, tgt_lens]
-    if transcripts is not None and n == 0:
-      args.append(transcripts)
-    fig.AddSubplot(
-        args,
-        TrimPaddingAndPlotAttention,
-        title=atten.name,
-        xlabel='Input',
-        ylabel='Output')
-  return fig.Finalize()
+    return
+
+  def ToLengths(paddings):
+    paddings = paddings if isinstance(paddings, list) else [paddings]
+    return [SequenceLength(p) for p in paddings]
+
+  def Get(lengths, i):
+    return lengths[0 if len(lengths) == 1 else i]
+
+  src_lens = ToLengths(src_paddings)
+  tgt_lens = ToLengths(tgt_paddings)
+
+  with plot.MatplotlibFigureSummary(
+      name + '/Attention',
+      max_outputs=max_outputs,
+      gridspec_kwargs={'hspace': 0.3}) as fig:
+    for n, atten in enumerate(attention_tensors):
+      # Diagnostic metric that decreases as attention picks up.
+      max_entropy = tf.math.log(tf.cast(Get(src_lens, n), tf.float32))
+      max_entropy = tf.expand_dims(tf.expand_dims(max_entropy, -1), -1)
+      atten_normalized_entropy = -atten * tf.math.log(atten +
+                                                      1e-10) / max_entropy
+      scalar(name + '/Attention/average_normalized_entropy/%d' % n,
+             tf.reduce_mean(atten_normalized_entropy))
+      args = [atten, Get(src_lens, n), Get(tgt_lens, n)]
+      if transcripts is not None and n == 0:
+        args.append(transcripts)
+      fig.AddSubplot(
+          args,
+          TrimPaddingAndPlotAttention,
+          title=name,
+          xlabel='Input',
+          ylabel='Output')
 
 
 def AddNormSummary(name, vs_gs):
@@ -158,7 +227,7 @@ def AddNormSummary(name, vs_gs):
   Returns:
     norm of variables, and norm of gradients.
   """
-  flatten = py_utils.NestedMap(child=vs_gs).Flatten()
+  flatten = py_utils.Flatten(vs_gs)
   v_norm = tf.sqrt(py_utils.SumSquared([v for (v, _) in flatten]))
   scalar('var_norm/%s' % name, v_norm)
   g_norm = tf.sqrt(py_utils.SumSquared([g for (_, g) in flatten]))
@@ -169,18 +238,113 @@ def AddNormSummary(name, vs_gs):
 def CollectVarHistogram(vs_gs):
   """Adds histogram summaries for variables and gradients."""
 
-  def SummaryNamePrefix(n):
-    return n.split(':')[0].replace('/', '.') + '/'
-
-  for var, grad in vs_gs.Flatten():
-    with tf.device(
-        var.device), tf.name_scope(var.name.split(':')[0] + '/summary'):
-      name_prefix = SummaryNamePrefix(var.name)
+  for name, (var, grad) in vs_gs.FlattenItems():
+    name = py_utils.SanitizeScopeKey(name)
+    with tf.device(var.device), tf.name_scope(name + '/summary'):
       if isinstance(grad, tf.IndexedSlices):
         var = tf.gather(var, grad.indices)
         grad = grad.values
       if var.dtype.is_complex:
         var = tf.abs(var)
         grad = tf.abs(grad)
-      histogram(name_prefix + 'var_hist', var)
-      histogram(name_prefix + 'grad_hist', grad)
+
+    histogram('var_hist/' + name, var)
+    histogram('grad_hist/' + name, grad)
+
+
+def PrepareSequenceForPlot(tensor, padding, name):
+  """Prepares a sequence feature for plotting.
+
+  The sequence feature is transposed and channels are flattened.
+
+  Args:
+    tensor: A n-D Tensor of shape [batch, time, ...].
+    padding: A Tensor of shape [batch, time].
+    name: A string as the name of the reshaped Tensor, which will be used as the
+      subcaption for plotting.
+
+  Returns:
+    A tuple of:
+      reshaped_tensor: A 3-D Tensor of shape [batch, dim, time].
+      sequence_length: A 1-D Tensor of shape [batch].
+  """
+  # Flatten any dimensions beyond the third into the third.
+  batch_size, max_len = py_utils.GetShape(tensor, 2)
+  plot_tensor = tf.reshape(tensor, [batch_size, max_len, -1])
+  plot_tensor = tf.transpose(plot_tensor, [0, 2, 1], name=name)
+  return (plot_tensor, SequenceLength(padding))
+
+
+def PlotSequenceFeatures(plots, name, **kwargs):
+  """Plots a stack of sequence features.
+
+  Args:
+    plots: A list of tuple (tensor, seq_len), as returned by
+      PrepareSequenceForPlot().
+    name: A string for the caption of the plot.
+    **kwargs: Keyword arguments passed to AddSubplot().
+  """
+  if not _ShouldAddSummary():
+    return
+
+  with plot.MatplotlibFigureSummary(name, figsize=(8, len(plots) * 3.5)) as fig:
+    for tensor, seq_len in plots:
+      fig.AddSubplot([tensor, seq_len],
+                     TrimPaddingAndPlotSequence,
+                     title=tensor.name,
+                     **kwargs)
+
+
+class StatsCounter(object):
+  """A single counter in TF."""
+
+  def __init__(self, name):
+    self._name = name
+    _, self._var = py_utils.CreateVariable(
+        name=name,
+        params=py_utils.WeightParams([], py_utils.WeightInit.Constant(0),
+                                     tf.int64),
+        trainable=False)
+    self._value = self._var.value() + 0  # Makes a copy.
+
+  def Value(self):
+    """Returns the current counter value."""
+    return self._value
+
+  def IncBy(self, delta):
+    """Increment the counter by delta and return the new value."""
+    # NOTE: We must ensure _value is computed (_var + 0) before
+    # updating _var with delta.
+    delta = tf.cast(delta, tf.int64)
+    with tf.control_dependencies([self._value]):
+      scalar(self._name, self._value)
+      return tf.identity(tf.assign_add(self._var, delta))
+
+
+class StepRateTracker(object):
+  """A class that tracks step/example rate."""
+
+  def __init__(self):
+    self._time_steps = []  # History of (timestamp, global_step, total_examples)
+
+  def ComputeStepRate(self, current_steps, total_examples):
+    """Computes the overall step rate."""
+    if self._time_steps:
+      total_examples += self._time_steps[-1][-1]
+    self._time_steps.append((time.time(), current_steps, total_examples))
+    # Keeps a relative long history to compute a smooth steps/second.
+    # Removes duplicate stats for step = 0 to get rid of the warm-up period.
+    while (self._time_steps[-1][1] - self._time_steps[0][1] > 10000 or
+           (len(self._time_steps) > 1 and
+            self._time_steps[0][1] == self._time_steps[1][1])):
+      del self._time_steps[0]
+    (t0, s0, e0), (t1, s1, e1) = self._time_steps[0], self._time_steps[-1]
+    rate = 0.0
+    example_rate = 0.0
+    if t1 > t0 + 1:
+      elapsed_secs = t1 - t0
+      rate = (s1 - s0) / elapsed_secs
+      example_rate = (e1 - e0) / elapsed_secs
+    tf.logging.info('Steps/second: %f, Examples/second: %f', rate,
+                         example_rate)
+    return rate, example_rate, total_examples

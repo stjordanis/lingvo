@@ -1,11 +1,12 @@
 """Setup autoconf repo for tensorflow."""
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("//third_party:repo.bzl", "third_party_http_archive")
 
 def _find_tf_include_path(repo_ctx):
     exec_result = repo_ctx.execute(
         [
-            "python",
+            "python3",
             "-c",
             "import tensorflow as tf; import sys; " +
             "sys.stdout.write(tf.sysconfig.get_include())",
@@ -14,12 +15,12 @@ def _find_tf_include_path(repo_ctx):
     )
     if exec_result.return_code != 0:
         fail("Could not locate tensorflow installation path.")
-    return exec_result.stdout
+    return exec_result.stdout.splitlines()[-1]
 
 def _find_tf_lib_path(repo_ctx):
     exec_result = repo_ctx.execute(
         [
-            "python",
+            "python3",
             "-c",
             "import tensorflow as tf; import sys; " +
             "sys.stdout.write(tf.sysconfig.get_lib())",
@@ -28,22 +29,22 @@ def _find_tf_lib_path(repo_ctx):
     )
     if exec_result.return_code != 0:
         fail("Could not locate tensorflow installation path.")
-    return exec_result.stdout
+    return exec_result.stdout.splitlines()[-1]
 
 def _eigen_archive_repo_impl(repo_ctx):
     tf_include_path = _find_tf_include_path(repo_ctx)
-    repo_ctx.symlink(
-        tf_include_path + "/external/eigen_archive",
-        "eigen_archive",
-    )
+    repo_ctx.symlink(tf_include_path, "tf_includes")
     repo_ctx.file(
         "BUILD",
         content = """
 cc_library(
     name = "includes",
-    hdrs = glob(["eigen_archive/**/*.h", "eigen_archive/**"]),
+    hdrs = glob(["tf_includes/Eigen/**/*.h",
+                 "tf_includes/Eigen/**",
+                 "tf_includes/unsupported/Eigen/**/*.h",
+                 "tf_includes/unsupported/Eigen/**"]),
     # https://groups.google.com/forum/#!topic/bazel-discuss/HyyuuqTxKok
-    includes = ["eigen_archive"],
+    includes = ["tf_includes"],
     visibility = ["//visibility:public"],
 )
 """,
@@ -66,6 +67,64 @@ cc_library(
         executable = False,
     )
 
+def _absl_includes_repo_impl(repo_ctx):
+    tf_include_path = _find_tf_include_path(repo_ctx)
+    repo_ctx.symlink(
+        tf_include_path + "/absl",
+        "absl",
+    )
+    repo_ctx.file(
+        "BUILD",
+        content = """
+cc_library(
+    name = "includes",
+    hdrs = glob(["absl/**/*.h",
+                 "absl/**/*.inc"]),
+    includes = ["absl"],
+    visibility = ["//visibility:public"],
+)
+""",
+        executable = False,
+    )
+
+def _zlib_includes_repo_impl(repo_ctx):
+    tf_include_path = _find_tf_include_path(repo_ctx)
+    repo_ctx.symlink(
+        tf_include_path + "/external/zlib_archive",
+        "zlib",
+    )
+    repo_ctx.file(
+        "BUILD",
+        content = """
+cc_library(
+    name = "includes",
+    hdrs = glob(["zlib/**/*.h"]),
+    includes = ["zlib"],
+    visibility = ["//visibility:public"],
+)
+""",
+        executable = False,
+    )
+
+def _protobuf_includes_repo_impl(repo_ctx):
+    tf_include_path = _find_tf_include_path(repo_ctx)
+    repo_ctx.symlink(tf_include_path, "tf_includes")
+    repo_ctx.file(
+        "BUILD",
+        content = """
+cc_library(
+    name = "includes",
+    hdrs = glob(["tf_includes/google/protobuf/*.h",
+                 "tf_includes/google/protobuf/*.inc",
+                 "tf_includes/google/protobuf/**/*.h",
+                 "tf_includes/google/protobuf/**/*.inc"]),
+    includes = ["tf_includes"],
+    visibility = ["//visibility:public"],
+)
+""",
+        executable = False,
+    )
+
 def _tensorflow_includes_repo_impl(repo_ctx):
     tf_include_path = _find_tf_include_path(repo_ctx)
     repo_ctx.symlink(tf_include_path, "tensorflow_includes")
@@ -77,7 +136,10 @@ cc_library(
     hdrs = glob(["tensorflow_includes/**/*.h",
                  "tensorflow_includes/third_party/eigen3/**"]),
     includes = ["tensorflow_includes"],
-    deps = ["@eigen_archive//:includes"],
+    deps = ["@absl_includes//:includes",
+            "@eigen_archive//:includes",
+            "@protobuf_archive//:includes",
+            "@zlib_includes//:includes",],
     visibility = ["//visibility:public"],
 )
 """,
@@ -92,7 +154,7 @@ def _tensorflow_solib_repo_impl(repo_ctx):
         content = """
 cc_library(
     name = "framework_lib",
-    srcs = ["tensorflow_solib/libtensorflow_framework.so"],
+    srcs = ["tensorflow_solib/libtensorflow_framework.so.2"],
     visibility = ["//visibility:public"],
 )
 """,
@@ -106,6 +168,18 @@ def cc_tf_configure():
         implementation = _nsync_includes_repo_impl,
     )
     make_nsync_repo(name = "nsync_includes")
+    make_absl_repo = repository_rule(
+        implementation = _absl_includes_repo_impl,
+    )
+    make_absl_repo(name = "absl_includes")
+    make_zlib_repo = repository_rule(
+        implementation = _zlib_includes_repo_impl,
+    )
+    make_zlib_repo(name = "zlib_includes")
+    make_protobuf_repo = repository_rule(
+        implementation = _protobuf_includes_repo_impl,
+    )
+    make_protobuf_repo(name = "protobuf_archive")
     make_tfinc_repo = repository_rule(
         implementation = _tensorflow_includes_repo_impl,
     )
@@ -116,7 +190,7 @@ def cc_tf_configure():
     make_tflib_repo(name = "tensorflow_solib")
 
 def lingvo_testonly_deps():
-    if "com_google_googletest" not in native.existing_rules():
+    if not native.existing_rule("com_google_googletest"):
         http_archive(
             name = "com_google_googletest",
             build_file_content = """
@@ -169,7 +243,21 @@ filegroup(
 )
 """,
         urls = [
-            "https://github.com/google/protobuf/releases/download/v3.6.1/protoc-3.6.1-linux-x86_64.zip",
+            "https://github.com/protocolbuffers/protobuf/releases/download/v3.8.0/protoc-3.8.0-linux-x86_64.zip",
         ],
-        sha256 = "6003de742ea3fcf703cfec1cd4a3380fd143081a2eb0e559065563496af27807",
+        sha256 = "717903f32653f07cd895cfe89ca18ff4ca35f825afa7fe17bcb5cb13bf628be0",
+    )
+
+def icu():
+    third_party_http_archive(
+        name = "icu",
+        strip_prefix = "icu-release-64-2",
+        sha256 = "dfc62618aa4bd3ca14a3df548cd65fe393155edd213e49c39f3a30ccd618fc27",
+        urls = [
+            "https://storage.googleapis.com/mirror.tensorflow.org/github.com/unicode-org/icu/archive/release-64-2.zip",
+            "https://github.com/unicode-org/icu/archive/release-64-2.zip",
+        ],
+        build_file = "//third_party/icu:BUILD.bazel",
+        system_build_file = "//third_party/icu:BUILD.system",
+        patch_file = "//third_party/icu:udata.patch",
     )

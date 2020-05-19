@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,19 +15,18 @@
 # ==============================================================================
 """Tests for input generator."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import string
-import tensorflow as tf
-
+import lingvo.compat as tf
+from lingvo.core import base_input_generator
 from lingvo.core import py_utils
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.tasks.punctuator import input_generator
+from six.moves import range
 
 
-class InputGeneratorTest(tf.test.TestCase):
+class InputGeneratorTest(test_utils.TestCase):
 
   def _CreatePunctuatorInputParams(self):
     p = input_generator.PunctuatorInput.Params()
@@ -46,33 +46,35 @@ class InputGeneratorTest(tf.test.TestCase):
 
   def testBasic(self):
     p = self._CreatePunctuatorInputParams()
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False):
       inp = input_generator.PunctuatorInput(p)
       # Runs a few steps.
       for _ in range(10):
-        sess.run(inp.GetPreprocessedInputBatch())
+        self.evaluate(inp.GetPreprocessedInputBatch())
 
   def testSourceTargetValues(self):
     max_length = 50
     p = self._CreatePunctuatorInputParams()
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False):
       inp = input_generator.PunctuatorInput(p)
-      tokenizer = inp.tokenizer_dict['default']
+      tokenizer = inp.tokenizer_dict[base_input_generator.DEFAULT_TOKENIZER_KEY]
 
-      fetched = py_utils.NestedMap(sess.run(inp.GetPreprocessedInputBatch()))
+      fetched = py_utils.NestedMap(
+          self.evaluate(inp.GetPreprocessedInputBatch()))
       source_ids = fetched.src.ids
       tgt_ids = fetched.tgt.ids
       tgt_labels = fetched.tgt.labels
 
-      expected_ref = ('His approach was inquisitive , a meeting of artful '
-                      'hesitation with fluid technique .')
+      expected_ref = (b'His approach was inquisitive , a meeting of artful '
+                      b'hesitation with fluid technique .')
 
-      normalized_ref = expected_ref.lower().translate(None, string.punctuation)
-      normalized_ref = ' '.join(normalized_ref.split())
-      _, expected_src_ids, _ = sess.run(
+      normalized_ref = expected_ref.lower().translate(
+          None, string.punctuation.encode('utf-8'))
+      normalized_ref = b' '.join(normalized_ref.split())
+      _, expected_src_ids, _ = self.evaluate(
           tokenizer.StringsToIds(
               tf.convert_to_tensor([normalized_ref]), max_length=max_length))
-      expected_tgt_ids, expected_tgt_labels, _ = sess.run(
+      expected_tgt_ids, expected_tgt_labels, _ = self.evaluate(
           tokenizer.StringsToIds(
               tf.convert_to_tensor([expected_ref]), max_length=max_length))
 

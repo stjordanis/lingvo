@@ -14,6 +14,9 @@ limitations under the License.
 ==============================================================================*/
 
 #include "lingvo/core/ops/input_common.h"
+
+#include "lingvo/core/ops/sequential_record_yielder.h"
+#include "lingvo/core/ops/chain_record_yielder.h"
 #include "lingvo/core/ops/weighted_mix_record_yielder.h"
 
 namespace tensorflow {
@@ -22,7 +25,10 @@ namespace lingvo {
 RecordYielder* ConstructYielder(const string& file_pattern,
                                 const std::vector<float>& input_source_weights,
                                 int64 file_random_seed, int64 file_buffer_size,
-                                int64 file_parallelism) {
+                                int64 file_buffer_size_in_seconds,
+                                int64 file_parallelism,
+                                bool require_sequential_order,
+                                int64 repeat_count, bool use_chaining) {
   std::vector<string> file_patterns;
   if (input_source_weights.empty()) {
     LOG(INFO) << "Input source weights are empty, fall back to legacy "
@@ -35,7 +41,17 @@ RecordYielder* ConstructYielder(const string& file_pattern,
         << "input_source_weight per coma-separated value "
         << "in file_pattern.";
   }
-  std::vector<RecordYielder*> yielders;
+  if (require_sequential_order) {
+    CHECK_EQ(file_patterns.size(), 1)
+        << "require_sequential_order does not support record mixing or "
+        << "chaining.";
+    return SequentialRecordYielder::New(file_patterns.front(), repeat_count);
+  } else {
+    CHECK_EQ(repeat_count, -1) << "Repeat count must not be set unless "
+                                  "require_sequential_order is true.";
+  }
+  std::vector<BasicRecordYielder::Options> yielder_options;
+
   for (int i = 0; i < file_patterns.size(); ++i) {
     BasicRecordYielder::Options yopts;
     yopts.file_pattern = file_patterns[i];
@@ -50,16 +66,27 @@ RecordYielder* ConstructYielder(const string& file_pattern,
       }
     }
     yopts.bufsize = file_buffer_size;
+    yopts.bufsize_in_seconds = file_buffer_size_in_seconds;
     yopts.parallelism = file_parallelism;
-    yielders.push_back(BasicRecordYielder::New(yopts));
+    yopts.source_id = i;
+    yielder_options.push_back(yopts);
   }
 
   RecordYielder* yielder = nullptr;
-  if (yielders.size() > 1) {
-    yielder = WeightedMixRecordYielder::New(file_random_seed, yielders,
-                                            input_source_weights);
+  if (yielder_options.size() == 1) {
+    yielder = BasicRecordYielder::New(yielder_options.front());
+  } else if (use_chaining) {
+    yielder = ChainRecordYielder::New(yielder_options);
   } else {
-    yielder = yielders.front();
+    std::vector<RecordYielder*> yielders;
+    yielders.reserve(yielder_options.size());
+    for (const auto& yopts : yielder_options) {
+      yielders.push_back(BasicRecordYielder::New(yopts));
+    }
+    yielder = WeightedMixRecordYielder::New(
+        file_random_seed,
+        yielders,
+        input_source_weights);
   }
   return yielder;
 }

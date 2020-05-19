@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,22 +15,19 @@
 # ==============================================================================
 """Tests for early_stop."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import os
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import early_stop
 from lingvo.core import hyperparams
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 
 
-class MetricHistoryTest(tf.test.TestCase):
+class MetricHistoryTest(test_utils.TestCase):
 
   def setUp(self):
+    super(MetricHistoryTest, self).setUp()
     early_stop.MetricHistory._metric_histories_map = {}
 
   def testSetLogdirInMetricHistories(self):
@@ -61,8 +59,8 @@ class MetricHistoryTest(tf.test.TestCase):
 
   def testMetricHistoriesFiles(self):
     logdir = tf.test.get_temp_dir()
-    tf.gfile.MkDir(os.path.join(logdir, 'job1'))
-    tf.gfile.MkDir(os.path.join(logdir, 'job2'))
+    tf.io.gfile.mkdir(os.path.join(logdir, 'job1'))
+    tf.io.gfile.mkdir(os.path.join(logdir, 'job2'))
 
     p = early_stop.MetricHistory.Params().Set(logdir=logdir)
     mh1 = early_stop.MetricHistory(
@@ -75,20 +73,24 @@ class MetricHistoryTest(tf.test.TestCase):
     early_stop.MetricHistory.ConditionalAppend('job2', 'm2', 1, 10.0)
     early_stop.MetricHistory.ConditionalAppend('job1', 'm1', 2, 5.0)
 
-    self.assertTrue(tf.gfile.Exists(mh1.hist_file))
-    self.assertTrue(tf.gfile.Exists(mh2.hist_file))
-    with tf.gfile.FastGFile(mh1.hist_file) as f:
+    self.assertTrue(tf.io.gfile.exists(mh1.hist_file))
+    self.assertTrue(tf.io.gfile.exists(mh2.hist_file))
+    with tf.io.gfile.GFile(mh1.hist_file) as f:
       lines = f.readlines()
       self.assertEqual(len(lines), 2)
       self.assertEqual(lines[0].rstrip(), '1 10.000000')
       self.assertEqual(lines[1].rstrip(), '2 5.000000')
-    with tf.gfile.FastGFile(mh2.hist_file) as f:
+    with tf.io.gfile.GFile(mh2.hist_file) as f:
       lines = f.readlines()
       self.assertEqual(len(lines), 1)
       self.assertEqual(lines[0].rstrip(), '1 10.000000')
 
 
-class EarlyStopTest(tf.test.TestCase):
+class EarlyStopTest(test_utils.TestCase):
+
+  def setUp(self):
+    super(EarlyStopTest, self).setUp()
+    early_stop.MetricHistory._metric_histories_map = {}
 
   def testEarlyStopDefaultIsNoOp(self):
     p = early_stop.EarlyStop.Params()
@@ -106,7 +108,7 @@ class EarlyStopTest(tf.test.TestCase):
 
   def testEarlyStopping(self):
     logdir = tf.test.get_temp_dir()
-    tf.gfile.MkDir(os.path.join(logdir, 'eval_dev'))
+    tf.io.gfile.mkdir(os.path.join(logdir, 'eval_dev'))
 
     p = early_stop.EarlyStop.Params()
     p.window = 2
@@ -143,7 +145,7 @@ class EarlyStopTest(tf.test.TestCase):
 
   def testEarlyStoppingAscendingMetric(self):
     logdir = tf.test.get_temp_dir()
-    tf.gfile.MkDir(os.path.join(logdir, 'decoder_dev'))
+    tf.io.gfile.mkdir(os.path.join(logdir, 'decoder_dev'))
 
     p = early_stop.EarlyStop.Params()
     p.window = 2

@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,13 +20,12 @@ from __future__ import division
 from __future__ import print_function
 
 import string
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_input_generator
 from lingvo.core import base_layer
+from lingvo.core import generic_input
 from lingvo.core import py_utils
 from lingvo.core import tokenizers
-from lingvo.core.ops import py_x_ops
 
 
 class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
@@ -60,9 +60,9 @@ class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
 
     def Normalize(line):
       # Lowercase and remove punctuation.
-      line = line.lower().translate(None, string.punctuation)
+      line = line.lower().translate(None, string.punctuation.encode('utf-8'))
       # Convert multiple consecutive spaces to a single one.
-      line = ' '.join(line.split())
+      line = b' '.join(line.split())
       return line
 
     normalized_line = tf.py_func(Normalize, [line], tf.string, stateful=False)
@@ -72,17 +72,18 @@ class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
     src_ids = src_labels
 
     # Compute the length for bucketing.
-    bucket_key = tf.to_int32(
-        tf.maximum(
-            tf.reduce_sum(1.0 - src_paddings),
-            tf.reduce_sum(1.0 - tgt_paddings)))
+    bucket_key = tf.cast(
+        tf.round(
+            tf.maximum(
+                tf.reduce_sum(1.0 - src_paddings),
+                tf.reduce_sum(1.0 - tgt_paddings))), tf.int32)
     tgt_weights = 1.0 - tgt_paddings
 
     # Return tensors in an order consistent with __init__.
     out_tensors = [
         src_ids, src_paddings, tgt_ids, tgt_paddings, tgt_labels, tgt_weights
     ]
-    return [tf.squeeze(t, axis=0) for t in out_tensors] + [bucket_key]
+    return [tf.squeeze(t, axis=0) for t in out_tensors], bucket_key
 
   def _DataSourceFromFilePattern(self, file_pattern):
     """Create the input processing op.
@@ -94,7 +95,7 @@ class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
       an operation that when executed, calls `_ProcessLine` on a line read
     from `file_pattern`.
     """
-    return py_x_ops.generic_input(
+    return generic_input.GenericInput(
         file_pattern=file_pattern,
         processor=self._ProcessLine,
         # Pad dimension 0 to the same length.
@@ -109,14 +110,20 @@ class PunctuatorInput(base_input_generator.BaseSequenceInputGenerator):
 
     # Build the input processing graph.
     (self._src_ids, self._src_paddings, self._tgt_ids, self._tgt_paddings,
-     self._tgt_labels, self._tgt_weights) = self._BuildDataSource()
+     self._tgt_labels,
+     self._tgt_weights), self._bucket_keys = self._BuildDataSource()
 
-    self._input_batch_size = tf.shape(self._src_ids)[0]
-    self._sample_ids = tf.range(0, self._input_batch_size, 1)
+    self._sample_ids = tf.range(0, self.InfeedBatchSize(), 1)
 
-  def InputBatch(self):
+  def InfeedBatchSize(self):
+    """Override BaseSequenceInputGenerator."""
+    return tf.shape(self._src_ids)[0]
+
+  def _InputBatch(self):
     """Returns a single batch as a `.NestedMap` to be passed to the model."""
     ret = py_utils.NestedMap()
+
+    ret.bucket_keys = self._bucket_keys
 
     ret.src = py_utils.NestedMap()
     ret.src.ids = tf.cast(self._src_ids, dtype=tf.int32)

@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,18 +14,61 @@
 # limitations under the License.
 """Tests for decoder utility functions."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import tensorflow as tf
-
+import lingvo.compat as tf
+from lingvo.core import rnn_cell
+from lingvo.core import symbolic
+from lingvo.core import test_utils
+from lingvo.tasks.asr import decoder
 from lingvo.tasks.asr import decoder_utils
 
 FLAGS = tf.flags.FLAGS
 
 
-class DecoderUtilsTokenizeTest(tf.test.TestCase):
+class DecoderUtilsSetRnnCellNodesTest(test_utils.TestCase):
+
+  def testSetRnnCellNodes(self):
+    decoder_p = decoder.AsrDecoder.Params()
+    base_rnn_p = rnn_cell.LSTMCellSimple.Params().Set(num_output_nodes=4)
+
+    # rnn_cell_dim > 0.
+    decoder_p.rnn_cell_dim = 8
+    rnn_p = base_rnn_p.Copy()
+    decoder_utils.SetRnnCellNodes(decoder_p, rnn_p)
+    self.assertEqual(rnn_p.num_output_nodes, decoder_p.rnn_cell_dim)
+
+    # rnn_cell_dim <= 0.
+    decoder_p.rnn_cell_dim = 0
+    rnn_p = base_rnn_p.Copy()
+    decoder_utils.SetRnnCellNodes(decoder_p, rnn_p)
+    self.assertEqual(rnn_p.num_output_nodes, base_rnn_p.num_output_nodes)
+
+    # rnn_cell_dim is a symbol.
+    decoder_p.rnn_cell_dim = symbolic.Symbol("rnn_cell_dim")
+    rnn_p = base_rnn_p.Copy()
+    decoder_utils.SetRnnCellNodes(decoder_p, rnn_p)
+    self.assertIs(rnn_p.num_output_nodes, decoder_p.rnn_cell_dim)
+
+    # rnn_cell_hidden_dim > 0.
+    decoder_p.rnn_cell_hidden_dim = 16
+    rnn_p = base_rnn_p.Copy()
+    decoder_utils.SetRnnCellNodes(decoder_p, rnn_p)
+    self.assertEqual(rnn_p.num_hidden_nodes, decoder_p.rnn_cell_hidden_dim)
+
+    # rnn_cell_hidden_dim <= 0.
+    decoder_p.rnn_cell_hidden_dim = 0
+    rnn_p = base_rnn_p.Copy()
+    decoder_utils.SetRnnCellNodes(decoder_p, rnn_p)
+    self.assertEqual(rnn_p.num_hidden_nodes, base_rnn_p.num_hidden_nodes)
+
+    # rnn_cell_hidden_dim is a symbol.
+    decoder_p.rnn_cell_hidden_dim = symbolic.Symbol("rnn_cell_hidden_dim")
+    rnn_p = base_rnn_p.Copy()
+    decoder_utils.SetRnnCellNodes(decoder_p, rnn_p)
+    self.assertIs(rnn_p.num_hidden_nodes, decoder_p.rnn_cell_hidden_dim)
+
+
+class DecoderUtilsTokenizeTest(test_utils.TestCase):
 
   def testTokenize(self):
     s = "onetoken"
@@ -38,7 +82,7 @@ class DecoderUtilsTokenizeTest(tf.test.TestCase):
                      decoder_utils.Tokenize(s))
 
 
-class DecoderUtilsComputeWerTest(tf.test.TestCase):
+class DecoderUtilsComputeWerTest(test_utils.TestCase):
 
   def testInvalidInputsExtraHyps(self):
     with self.session():
@@ -94,7 +138,7 @@ class DecoderUtilsComputeWerTest(tf.test.TestCase):
       self.assertAllEqual(wer.eval(), [[1, 2], [1, 2]])
 
 
-class DecoderUtilsFilterTest(tf.test.TestCase):
+class DecoderUtilsFilterTest(test_utils.TestCase):
 
   def testFilterEpsilon(self):
     s = "no epsilon"
@@ -112,7 +156,7 @@ class DecoderUtilsFilterTest(tf.test.TestCase):
     self.assertEqual("noise tokens are removed", decoder_utils.FilterNoise(s))
 
 
-class DecoderUtilsEditDistanceTest(tf.test.TestCase):
+class DecoderUtilsEditDistanceTest(test_utils.TestCase):
 
   def testEditDistance1(self):
     ref = "a b c d e f g h"

@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,34 +15,30 @@
 # ==============================================================================
 """Tests for trainer."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import os
 import random
 import re
 import shutil
 
-import numpy as np
-import tensorflow as tf
-
 from lingvo import base_trial
 from lingvo import model_registry
 from lingvo import trainer
+import lingvo.compat as tf
 from lingvo.core import base_input_generator
 from lingvo.core import base_layer
 from lingvo.core import base_model
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 from lingvo.core import trainer_test_utils
 from lingvo.tasks.image.input_generator import FakeMnistData
-import lingvo.tasks.image.params.mnist  # pylint: disable=unused-import
-import lingvo.tasks.lm.params.one_billion_wds  # pylint: disable=unused-import
+import numpy as np
+from six.moves import range
 
 FLAGS = tf.flags.FLAGS
 
 
-class BaseTrainerTest(tf.test.TestCase):
+class BaseTrainerTest(test_utils.TestCase):
   """Base class for the test cases."""
 
   def __init__(self, *args, **kwargs):
@@ -50,7 +47,13 @@ class BaseTrainerTest(tf.test.TestCase):
 
   def setUp(self):
     FLAGS.model_params_override = ''
-    FLAGS.tf_master = tf.train.Server.create_local_server().target
+    # TODO(donglin): Use tf.distribute.Server.create_local_server().target after
+    # create_local_server() has been updated to use 'localhost' as job name
+    # in OSS TensorFlow.
+    FLAGS.tf_master = tf.distribute.Server({'localhost': ['localhost:0']},
+                                           protocol='grpc',
+                                           config=None,
+                                           start=True).target
     FLAGS.vizier_reporting_job = 'decoder'
 
   def _CreateController(self, cfg):
@@ -83,7 +86,7 @@ class BaseTrainerTest(tf.test.TestCase):
 
   def _HasLine(self, filename, pattern):
     """Returns True iff one line in the given file matches the pattern."""
-    with tf.gfile.FastGFile(filename, 'r') as f:
+    with tf.io.gfile.GFile(filename, 'r') as f:
       lines = f.readlines()
     return any(re.search(pattern, _) for _ in lines)
 
@@ -100,10 +103,10 @@ class TrainerTest(BaseTrainerTest):
     cfg.cluster.task = 0
     cfg.cluster.mode = 'sync'
     cfg.cluster.job = 'trainer_client'
-    cfg.cluster.worker.name = '/job:local'
+    cfg.cluster.worker.name = '/job:localhost'
     cfg.cluster.worker.replicas = 1
     cfg.cluster.worker.gpus_per_replica = 0
-    cfg.cluster.ps.name = '/job:local'
+    cfg.cluster.ps.name = '/job:localhost'
     cfg.cluster.ps.replicas = 1
     cfg.cluster.ps.gpus_per_replica = 0
 
@@ -126,10 +129,10 @@ class TrainerTest(BaseTrainerTest):
         [self._CreateController(cfg),
          self._CreateTrainer(cfg)])
 
-    train_files = tf.gfile.Glob(logdir + '/train/*')
+    train_files = tf.io.gfile.glob(logdir + '/train/*')
     self.assertTrue(self._HasFile(train_files, 'ckpt'))
     self.assertTrue(self._HasFile(train_files, 'tfevents'))
-    control_files = tf.gfile.Glob(logdir + '/control/*')
+    control_files = tf.io.gfile.glob(logdir + '/control/*')
     self.assertTrue(self._HasFile(control_files, 'params.txt'))
     self.assertTrue(self._HasFile(control_files, 'model_analysis.txt'))
     self.assertTrue(self._HasFile(control_files, 'train.pbtxt'))
@@ -140,7 +143,7 @@ class TrainerTest(BaseTrainerTest):
     # steps.
     runner_manager.StartRunners([self._CreateEvalerDev(cfg)])
 
-    dev_files = tf.gfile.Glob(logdir + '/eval_dev/*')
+    dev_files = tf.io.gfile.glob(logdir + '/eval_dev/*')
     self.assertTrue(self._HasFile(dev_files, 'params.txt'))
     self.assertTrue(self._HasFile(dev_files, 'eval_dev.pbtxt'))
     self.assertTrue(self._HasFile(dev_files, 'tfevents'))
@@ -161,23 +164,48 @@ class TrainerTest(BaseTrainerTest):
          self._CreateTrainer(cfg)])
     runner_manager.StartRunners([self._CreateDecoderDev(cfg)])
 
-    dec_files = tf.gfile.Glob(logdir + '/decoder_dev/*')
+    dec_files = tf.io.gfile.glob(logdir + '/decoder_dev/*')
     self.assertTrue(self._HasFile(dec_files, 'params.txt'))
     self.assertTrue(self._HasFile(dec_files, 'decoder_dev.pbtxt'))
     self.assertTrue(self._HasFile(dec_files, 'tfevents'))
-    self.assertTrue(self._HasFile(dec_files, 'score'))
+    # Only the score for the 2-step checkpoint should be present.
+    self.assertTrue(
+        tf.io.gfile.exists(
+            os.path.join(logdir, 'decoder_dev/score-00000002.txt')))
+    self.assertFalse(
+        tf.io.gfile.exists(
+            os.path.join(logdir, 'decoder_dev/score-00000000.txt')))
     self.assertTrue(
         self._HasLine(
             self._GetMatchedFileName(dec_files, 'score'), 'examples/sec'))
+
+    # Test customization of an eval checkpoint.  Create a new logdir / decoder
+    # but point the eval checkpoint to the 0th checkpoint of the most
+    # recent experiment.
+    new_logdir = os.path.join(tf.test.get_temp_dir(),
+                              'decoder_test' + str(random.random()))
+    FLAGS.logdir = new_logdir
+    cfg = self._GetTestConfig()
+    cfg.task.eval.load_checkpoint_from = os.path.join(logdir,
+                                                      'train/ckpt-00000000')
+
+    runner_manager.StartRunners([self._CreateDecoderDev(cfg)])
+    # Only the score for the 0th checkpoint should be present.
+    self.assertTrue(
+        tf.io.gfile.exists(
+            os.path.join(new_logdir, 'decoder_dev/score-00000000.txt')))
+    self.assertFalse(
+        tf.io.gfile.exists(
+            os.path.join(new_logdir, 'decoder_dev/score-00000002.txt')))
 
   def testWriteInferenceGraph(self):
     random.seed()
     logdir = os.path.join(tf.test.get_temp_dir(),
                           'inference_graphs' + str(random.random()))
     FLAGS.logdir = logdir
-    cfg = 'lm.one_billion_wds.WordLevelOneBwdsSimpleSampledSoftmax'
+    cfg = 'punctuator.codelab.RNMTModel'
     trainer.RunnerManager(cfg).WriteInferenceGraph()
-    inference_files = tf.gfile.Glob(logdir + '/inference_graphs/*')
+    inference_files = tf.io.gfile.glob(logdir + '/inference_graphs/*')
     self.assertTrue(self._HasFile(inference_files, 'inference.pbtxt'))
     self.assertTrue(self._HasFile(inference_files, 'inference_tpu.pbtxt'))
 
@@ -225,10 +253,12 @@ class TrainerWithTrialTest(TrainerTest):
     # report_done.
     self.assertEqual(trial.ReportEvalMeasure.call_count, 0)
 
-    train_files = tf.gfile.Glob(logdir + '/train/*')
+    train_files = tf.io.gfile.glob(logdir + '/train/*')
+    self.assertTrue(self._HasFile(train_files, 'params.txt'))
+    self.assertTrue(self._HasFile(train_files, 'trainer_params.txt'))
     self.assertTrue(self._HasFile(train_files, 'ckpt'))
     self.assertTrue(self._HasFile(train_files, 'tfevents'))
-    control_files = tf.gfile.Glob(logdir + '/control/*')
+    control_files = tf.io.gfile.glob(logdir + '/control/*')
     self.assertTrue(self._HasFile(control_files, 'params.txt'))
     self.assertTrue(self._HasFile(control_files, 'model_analysis.txt'))
     self.assertTrue(self._HasFile(control_files, 'train.pbtxt'))
@@ -246,7 +276,7 @@ class TrainerWithTrialTest(TrainerTest):
     after_decoder_count = trial.ReportEvalMeasure.call_count
     self.assertGreater(after_decoder_count, 0)
 
-    dev_files = tf.gfile.Glob(logdir + '/eval_dev/*')
+    dev_files = tf.io.gfile.glob(logdir + '/eval_dev/*')
     self.assertTrue(self._HasFile(dev_files, 'params.txt'))
     self.assertTrue(self._HasFile(dev_files, 'eval_dev.pbtxt'))
     self.assertTrue(self._HasFile(dev_files, 'tfevents'))
@@ -267,10 +297,10 @@ class ProcessFPropResultsTest(BaseTrainerTest):
     cfg.cluster.task = 0
     cfg.cluster.mode = 'sync'
     cfg.cluster.job = 'trainer_client'
-    cfg.cluster.worker.name = '/job:local'
+    cfg.cluster.worker.name = '/job:localhost'
     cfg.cluster.worker.replicas = 1
     cfg.cluster.worker.gpus_per_replica = 0
-    cfg.cluster.ps.name = '/job:local'
+    cfg.cluster.ps.name = '/job:localhost'
     cfg.cluster.ps.replicas = 1
     cfg.cluster.ps.gpus_per_replica = 0
     cfg.train.max_steps = steps

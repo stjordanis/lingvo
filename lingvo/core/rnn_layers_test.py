@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,20 +14,10 @@
 # limitations under the License.
 """Tests for rnn_layers."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import os
 import types
-import unittest
-
-import numpy as np
-from six.moves import range
-from six.moves import zip
-import tensorflow as tf
-
-from tensorflow.python.ops import inplace_ops
+from absl.testing import parameterized
+import lingvo.compat as tf
 from lingvo.core import attention
 from lingvo.core import base_layer
 from lingvo.core import cluster_factory
@@ -35,6 +26,11 @@ from lingvo.core import py_utils
 from lingvo.core import rnn_cell
 from lingvo.core import rnn_layers
 from lingvo.core import test_utils
+import numpy as np
+from six.moves import range
+from six.moves import zip
+
+from tensorflow.python.ops import inplace_ops
 
 FLAGS = tf.flags.FLAGS
 
@@ -61,7 +57,7 @@ def AddTimestepAccumulator(layer):
   layer.RegisterAccumulator('ts_count', TimestepAccumulator())
 
 
-class LayersTestBase(tf.test.TestCase):
+class LayersTestBase(test_utils.TestCase):
 
   def _testStackedFRNNHelper(self,
                              cls,
@@ -71,13 +67,13 @@ class LayersTestBase(tf.test.TestCase):
                              bi_directional=False,
                              input_dim=-1,
                              output_dim=-1):
-    tf.set_random_seed(123456)
+    tf.random.set_seed(123456)
     batch = 3
     dims = 16
     slen = 10 + trailing_pad_len
     num_layers = 4
     with tf.Graph().as_default() as g:
-      with self.session(use_gpu=True, graph=g) as sess:
+      with self.session(use_gpu=True, graph=g):
         params = rnn_cell.LSTMCellSimple.Params()
         params.name = 'lstm'
         params.output_nonlinearity = True
@@ -101,7 +97,7 @@ class LayersTestBase(tf.test.TestCase):
         sfrnn_params.num_input_nodes = input_dim
         sfrnn_params.num_output_nodes = output_dim
         with tf.name_scope('sfrnn'):
-          sfrnn = sfrnn_params.cls(sfrnn_params)
+          sfrnn = sfrnn_params.Instantiate()
 
         np.random.seed(12345)
         input_dim = input_dim if input_dim > 0 else dims
@@ -114,17 +110,17 @@ class LayersTestBase(tf.test.TestCase):
           paddings[-trailing_pad_len - 3:-trailing_pad_len - 1, :] = 1.0
         paddings = tf.constant(paddings, dtype)
 
-        tf.global_variables_initializer().run()
+        self.evaluate(tf.global_variables_initializer())
         if bi_directional:
           sfrnn_outputs = sfrnn.FPropFullSequence(sfrnn.theta, inputs, paddings)
           sfrnn_outputs = py_utils.HasShape(sfrnn_outputs,
                                             [slen, batch, output_dim])
-          return sess.run(sfrnn_outputs)
+          return self.evaluate(sfrnn_outputs)
         else:
           sfrnn_outputs, sfrnn_final = sfrnn.FPropDefaultTheta(inputs, paddings)
           sfrnn_outputs = py_utils.HasShape(sfrnn_outputs,
                                             [slen, batch, output_dim])
-          return sess.run([sfrnn_outputs, sfrnn_final])
+          return self.evaluate([sfrnn_outputs, sfrnn_final])
 
   def _testStackedFRNNGradHelper(self, cls, bi_directional=False):
     trailing_pad_len = 2
@@ -153,7 +149,7 @@ class LayersTestBase(tf.test.TestCase):
       sfrnn_params.num_layers = num_layers
       sfrnn_params.skip_start = 2
       with tf.name_scope('sfrnn'):
-        sfrnn = sfrnn_params.cls(sfrnn_params)
+        sfrnn = sfrnn_params.Instantiate()
 
       np.random.seed(12345)
       inputs = tf.constant(np.random.uniform(size=(slen, batch, dims)), dtype)
@@ -170,13 +166,13 @@ class LayersTestBase(tf.test.TestCase):
         loss = tf.reduce_sum(sfrnn_outputs)
         for fin in sfrnn_final.rnn:
           loss += tf.reduce_sum(fin.m) + tf.reduce_sum(fin.c)
-      xs = sfrnn.theta.Flatten() + [inputs]
+      xs = sfrnn.vars.Flatten() + [inputs]
       dxs = tf.gradients(loss, xs)
 
       # Compares the sym grad against the numeric grads.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
       grad_step = 17
-      sym_grads = sess.run(dxs)
+      sym_grads = self.evaluate(dxs)
       sym_grads = [test_utils.PickEveryN(_, grad_step) for _ in sym_grads]
       num_grads = [
           test_utils.PickEveryN(
@@ -191,13 +187,13 @@ class LayersTestBase(tf.test.TestCase):
         self.assertAllClose(sym, num)
 
 
-class LayersTest(LayersTestBase):
+class LayersTest(LayersTestBase, parameterized.TestCase):
 
   def testIdentitySeqLayer(self):
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False):
       rnn_params = rnn_layers.IdentitySeqLayer.Params()
       rnn_params.name = 'no_op'
-      rnn = rnn_params.cls(rnn_params)
+      rnn = rnn_params.Instantiate()
 
       np.random.seed(12345)
       inputs_sequence = []
@@ -214,13 +210,13 @@ class LayersTest(LayersTestBase):
       outputs = rnn.FPropFullSequence(rnn.theta, inputs, paddings)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
-      inputs_v, outputs_v = sess.run([inputs, outputs])
+      inputs_v, outputs_v = self.evaluate([inputs, outputs])
       self.assertAllEqual(inputs_v, outputs_v)
 
   def testRNN(self):
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False):
       params = rnn_cell.LSTMCellSimple.Params()
       params.name = 'lstm'
       params.output_nonlinearity = True
@@ -256,9 +252,9 @@ class LayersTest(LayersTestBase):
       sum_outputs = tf.reduce_sum(outputs, axis=0)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
-      actual = sess.run(py_utils.NestedMap(sum=sum_outputs, **final))
+      actual = self.evaluate(py_utils.NestedMap(sum=sum_outputs, **final))
 
       # In case this test ever breaks, you can uncomment the line below, copy
       # out the golden values, and then comment out the line below again.
@@ -272,138 +268,6 @@ class LayersTest(LayersTestBase):
       self.assertAllClose(sum_expected, actual.sum)
       self.assertAllClose(m_expected, actual.m)
       self.assertAllClose(c_expected, actual.c)
-
-  def _CreateCuDNNLSTMParams(self,
-                             input_nodes,
-                             cell_nodes,
-                             dtype=tf.float32,
-                             is_eval=False):
-    params = rnn_layers.CuDNNLSTM.Params()
-    params.name = 'cudnn_lstm'
-    params.dtype = dtype
-    params.params_init = py_utils.WeightInit.Uniform(1.24, 429891685)
-    params.vn.global_vn = False
-    params.vn.per_step_vn = False
-    params.is_eval = is_eval
-    params.cell = rnn_cell.LSTMCellSimple.Params()
-    params.cell.name = 'lstm_cell'
-    params.cell.num_input_nodes = input_nodes
-    params.cell.num_output_nodes = cell_nodes
-    params.cell.cell_value_cap = None
-    params.cell.forget_gate_bias = 0
-    return params
-
-  @unittest.skipUnless(tf.test.is_built_with_cuda(), 'Only available on GPU.')
-  def testCuDNNLSTM(self):
-    batch_size = 3
-    seq_length = 10
-    input_nodes = 4
-    cell_nodes = 2
-
-    np.random.seed(12345)
-    inputs_v = np.random.uniform(size=(seq_length, batch_size, input_nodes))
-    paddings_v = np.zeros((seq_length, batch_size, 1))
-    model_var_v = np.random.uniform(
-        size=((input_nodes + cell_nodes) * 4 * cell_nodes + 8 * cell_nodes))
-
-    def _CreateLayer(is_eval):
-      params = self._CreateCuDNNLSTMParams(
-          input_nodes, cell_nodes, is_eval=is_eval)
-      rnn = rnn_layers.CuDNNLSTM(params)
-      inputs = tf.constant(inputs_v, dtype=params.dtype)
-      paddings = tf.constant(paddings_v, dtype=params.dtype)
-      outputs, final = rnn.FPropDefaultTheta(inputs, paddings)
-      # Set outputs of padding inputs to 0. for comparison.
-      outputs *= 1 - paddings
-
-      if not is_eval:
-        all_vars = tf.get_collection('CuDNNLSTM_vars')
-        assert len(all_vars) == 1
-        model_var_init = tf.assign(all_vars[0], model_var_v)
-        return model_var_init, outputs, final
-      else:
-        return outputs, final
-
-    # Train graph
-    with tf.Graph().as_default() as g:
-      with self.session(use_gpu=True, graph=g) as sess:
-        tf.set_random_seed(87654321)
-        init_op, outputs, final = _CreateLayer(is_eval=False)  # pylint:disable=unbalanced-tuple-unpacking
-        saver = tf.train.Saver()
-
-        # Initialize all the variables, and then run one step.
-        tf.global_variables_initializer().run()
-        init_op.op.run()
-
-        save_path = os.path.join(self.get_temp_dir(), 'cudnn-lstm-test')
-        saver.save(sess, save_path)
-
-        (cudnn_outputs_v, cudnn_m_v,
-         cudnn_c_v) = sess.run([outputs, final.m, final.c])
-
-    # Eval graph
-    with tf.Graph().as_default() as g:
-      with self.session(use_gpu=False, graph=g) as sess:
-        tf.set_random_seed(87654321)
-        outputs, final = _CreateLayer(is_eval=True)  # pylint:disable=unbalanced-tuple-unpacking
-        saver = tf.train.Saver()
-
-        # Initialize all the variables, and then run one step.
-        tf.global_variables_initializer().run()
-        saver.restore(sess, save_path)
-
-        (rnn_outputs_v, rnn_m_v,
-         rnn_c_v) = sess.run([outputs, final.m, final.c])
-
-    # CuDNNLSTM train and eval mode are equivalent and its checkpoints can
-    # be consumed by FRNN in eval mode.
-    self.assertAllClose(rnn_outputs_v, cudnn_outputs_v)
-    self.assertAllClose(rnn_m_v, np.squeeze(cudnn_m_v))
-    self.assertAllClose(rnn_c_v, np.squeeze(cudnn_c_v))
-
-  @unittest.skipUnless(tf.test.is_built_with_cuda(), 'Only available on GPU.')
-  def testCuDNNLSTMGradientChecker(self):
-    batch_size = 3
-    seq_length = 10
-    input_nodes = 4
-    cell_nodes = 2
-    dtype = tf.float64
-
-    np.random.seed(12345)
-    inputs_v = np.random.uniform(size=(seq_length, batch_size, input_nodes))
-    paddings_v = np.random.uniform(size=(seq_length, batch_size, 1))
-    paddings_v[-1] = np.expand_dims(
-        np.expand_dims(np.array([1.] * (batch_size - 1) + [0.]), 0), 2)
-    paddings_v[-2] = np.zeros((1, batch_size, 1))
-
-    with tf.Graph().as_default() as g:
-      with self.session(use_gpu=True) as sess:
-        tf.set_random_seed(87654321)
-        params = self._CreateCuDNNLSTMParams(
-            input_nodes, cell_nodes, dtype=dtype, is_eval=False)
-        rnn = rnn_layers.CuDNNLSTM(params)
-        inputs = tf.constant(inputs_v, dtype=params.dtype)
-        paddings = tf.constant(paddings_v, dtype=params.dtype)
-
-        with tf.device('/gpu:0'):
-          outputs, final = rnn.FPropDefaultTheta(inputs, paddings)
-        all_vars = tf.get_collection('CuDNNLSTM_vars')
-        assert len(all_vars) == 1
-
-        loss = tf.reduce_sum(outputs * paddings) + tf.add_n(
-            [tf.reduce_sum(x) for x in final.Flatten()])
-        grads = tf.gradients(loss, all_vars)
-
-        # Initialize all the variables, and then run one step.
-        tf.global_variables_initializer().run()
-
-        symbolic_grads = [gd.eval() for gd in grads]
-        numerical_grads = []
-        for v in all_vars:
-          numerical_grads.append(
-              test_utils.ComputeNumericGradient(sess, loss, v))
-        for x, y in zip(symbolic_grads, numerical_grads):
-          self.assertAllClose(x, y)
 
   def testRNNGradientChecker(self):
     with self.session(use_gpu=False) as sess:
@@ -449,7 +313,7 @@ class LayersTest(LayersTestBase):
       grads = tf.gradients(loss, all_vars)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
       symbolic_grads = [gd.eval() for gd in grads]
       numerical_grads = []
@@ -469,7 +333,7 @@ class LayersTest(LayersTestBase):
     padding_steps = 2
     batch_size = 2
     depth = 3
-    with self.session(use_gpu=True) as sess:
+    with self.session(use_gpu=True):
       lstm_params = rnn_cell.LSTMCellSimple.Params()
       lstm_params.output_nonlinearity = True
       lstm_params.num_input_nodes = depth
@@ -518,13 +382,13 @@ class LayersTest(LayersTestBase):
       # theta so the results should match
       bak_outputs, _ = bak_rnn.FProp(fwd_rnn.theta, fwd_inputs, fwd_paddings)
 
-      tf.global_variables_initializer().run()
-      actual_reversed_outputs, actual_bak_outputs = sess.run(
+      self.evaluate(tf.global_variables_initializer())
+      actual_reversed_outputs, actual_bak_outputs = self.evaluate(
           [reversed_outputs, bak_outputs])
       self.assertAllClose(actual_reversed_outputs, actual_bak_outputs)
 
   def testRNNWithConvLSTMCell(self):
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False):
       params = rnn_cell.ConvLSTMCell.Params()
       params.name = 'conv_lstm'
       params.output_nonlinearity = True
@@ -564,8 +428,8 @@ class LayersTest(LayersTestBase):
       sum_final_c = tf.reduce_sum(final.c, [1, 2, 3])
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      actual = sess.run(
+      self.evaluate(tf.global_variables_initializer())
+      actual = self.evaluate(
           py_utils.NestedMap(sum=sum_outputs, m=sum_final_m, c=sum_final_c))
 
       # In case this test ever breaks, you can uncomment the line below, copy
@@ -583,7 +447,7 @@ class LayersTest(LayersTestBase):
       self.assertAllClose(c_expected, actual.c)
 
   def _testFRNNWithConvLSTMCell(self):
-    with self.session(use_gpu=True) as sess:
+    with self.session(use_gpu=True):
       params = rnn_cell.ConvLSTMCell.Params()
       params.name = 'conv_lstm'
       params.output_nonlinearity = True
@@ -627,7 +491,7 @@ class LayersTest(LayersTestBase):
       frnn_params.vn = rnn_params.vn
 
       with tf.variable_scope('frnn'):
-        frnn = frnn_params.cls(frnn_params)
+        frnn = frnn_params.Instantiate()
 
       frnn_outputs, frnn_final = frnn.FPropDefaultTheta(
           tf.stack(inputs_sequence), tf.stack(paddings_sequence))
@@ -636,10 +500,11 @@ class LayersTest(LayersTestBase):
                                  tf.concat([tf.shape(paddings), [1, 1]], 0))
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
       (rnn_outputs_v, rnn_final_v, frnn_outputs_v,
-       frnn_final_v) = sess.run([rnn_outputs, final, frnn_outputs, frnn_final])
+       frnn_final_v) = self.evaluate(
+           [rnn_outputs, final, frnn_outputs, frnn_final])
 
       self.assertAllClose(rnn_outputs_v, frnn_outputs_v)
       self.assertAllClose(rnn_final_v.m, frnn_final_v.m)
@@ -685,13 +550,13 @@ class LayersTest(LayersTestBase):
                             [rnn_params.sequence_length, -1, 1, 1, 1])
       loss = tf.reduce_sum(tf.reduce_sum(
           outputs, axis=0)) + tf.reduce_sum(final.m + final.c)
-      all_vars = tf.all_variables()
+      all_vars = tf.trainable_variables()
       assert len(all_vars) == 2
 
       grads = tf.gradients(loss, all_vars)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
       symbolic_grads = [gd.eval() for gd in grads]
       numerical_grads = []
@@ -728,13 +593,13 @@ class LayersTest(LayersTestBase):
       outputs, final = frnn.FPropDefaultTheta(inputs_sequence, paddings)
       outputs *= tf.reshape(paddings, [10, 3, 1, 1, 1])
       loss = tf.reduce_sum(outputs) + tf.reduce_sum(final.m + final.c)
-      all_vars = tf.all_variables()
+      all_vars = tf.trainable_variables()
       assert len(all_vars) == 2
 
       grads = tf.gradients(loss, all_vars)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
       symbolic_grads = [gd.eval() for gd in grads]
       numerical_grads = []
@@ -782,7 +647,7 @@ class LayersTest(LayersTestBase):
       grads = tf.gradients(loss, all_vars)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
       symbolic_grads = [gd.eval() for gd in grads]
       numerical_grads = []
@@ -796,7 +661,7 @@ class LayersTest(LayersTestBase):
     batch = 3
     dims = 16
     slen = 10
-    with self.session(use_gpu=True, config=config) as sess:
+    with self.session(use_gpu=True, config=config):
       params = rnn_cell.LSTMCellSimple.Params()
       params.name = 'lstm'
       params.output_nonlinearity = True
@@ -837,8 +702,8 @@ class LayersTest(LayersTestBase):
           tf.unstack(inputs), tf.unstack(paddings))
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      frnn_out, frnn_final, rnn_out, rnn_final = sess.run(
+      self.evaluate(tf.global_variables_initializer())
+      frnn_out, frnn_final, rnn_out, rnn_final = self.evaluate(
           [frnn_outputs, frnn_final, rnn_outputs, rnn_final])
       self.assertAllClose(frnn_out, rnn_out)
       self.assertAllClose(frnn_final.m, rnn_final.m)
@@ -886,9 +751,9 @@ class LayersTest(LayersTestBase):
       dw, db, dinputs = tf.gradients(loss, [w, b, inputs])
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
       grad_step = 7
-      sym_grads = sess.run([db, dw, dinputs])
+      sym_grads = self.evaluate([db, dw, dinputs])
       sym_grads = [test_utils.PickEveryN(_, grad_step) for _ in sym_grads]
       num_grads = [
           test_utils.PickEveryN(
@@ -976,7 +841,8 @@ class LayersTest(LayersTestBase):
     dims = 16
     slen = 10 + trailing_pad_len
     with self.session(
-        use_gpu=True, config=tf.ConfigProto(allow_soft_placement=True)) as sess:
+        use_gpu=True,
+        config=tf.config_pb2.ConfigProto(allow_soft_placement=True)):
       params = rnn_cell.LSTMCellSimple.Params()
       params.name = 'lstm_forward'
       params.output_nonlinearity = True
@@ -1023,9 +889,10 @@ class LayersTest(LayersTestBase):
               tf.unstack(inputs), tf.unstack(paddings))
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
       rnn_outputs_val, frnn_outputs_val = [
-          x[:-trailing_pad_len] for x in sess.run([rnn_outputs, frnn_outputs])
+          x[:-trailing_pad_len]
+          for x in self.evaluate([rnn_outputs, frnn_outputs])
       ]
       self.assertAllClose(rnn_outputs_val, frnn_outputs_val)
 
@@ -1083,9 +950,9 @@ class LayersTest(LayersTestBase):
       dw0, db0, dw1, db1, dinputs = tf.gradients(loss, [w0, b0, w1, b1, inputs])
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
       grad_step = 13
-      sym_grads = sess.run([dw0, db0, dw1, db1, dinputs])
+      sym_grads = self.evaluate([dw0, db0, dw1, db1, dinputs])
       sym_grads = [test_utils.PickEveryN(_, grad_step) for _ in sym_grads]
       num_grads = [
           test_utils.PickEveryN(
@@ -1189,16 +1056,16 @@ class LayersTest(LayersTestBase):
       de_atten.source_dim = alt_depth
       p.source_name_to_attention_params = {'de': de_atten}
       merger_tpl.pre_proj_input_dims = [dims, dims, alt_depth]
-      merger_tpl.pre_proj_output_dim = dims
+      merger_tpl.pre_proj_output_dims = [dims, dims, dims]
       merger_tpl.proj_tpl.batch_norm = False
       merger_tpl.proj_tpl.weight_norm = True
 
     return p
 
   def testMultiSourceFRNNWithAttention(self):
-    with self.session(use_gpu=True) as sess:
+    with self.session(use_gpu=True):
       p = self._MultiSourceFRNNWithAttentionParams()
-      msrc_frnn = p.cls(p)
+      msrc_frnn = p.Instantiate()
 
       (src_encs, src_paddings, inputs,
        paddings) = self._MultiSourceFRNNWithAttentionInputs()
@@ -1207,8 +1074,8 @@ class LayersTest(LayersTestBase):
       msrc_frnn_out = tf.concat([a, m], 2)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      ys = sess.run([msrc_frnn_out])[0]
+      self.evaluate(tf.global_variables_initializer())
+      ys = self.evaluate([msrc_frnn_out])[0]
       self.assertEqual(ys.shape, (7, 6, 8))
       print(np.sum(ys, axis=(1, 2)), np.sum(ys, axis=(0, 1)),
             np.sum(ys, axis=(0, 2)))
@@ -1233,9 +1100,9 @@ class LayersTest(LayersTestBase):
       # pylint: enable=bad-whitespace
 
   def testMultiSourceFRNNWithAttentionMultiDepth(self):
-    with self.session(use_gpu=True) as sess:
+    with self.session(use_gpu=True):
       p = self._MultiSourceFRNNWithAttentionParams(single_source_length=False)
-      msrc_frnn = p.cls(p)
+      msrc_frnn = p.Instantiate()
 
       (src_encs, src_paddings, inputs, paddings
       ) = self._MultiSourceFRNNWithAttentionInputs(single_source_length=False)
@@ -1244,8 +1111,8 @@ class LayersTest(LayersTestBase):
       msrc_frnn_out = tf.concat([a, m], 2)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      ys = sess.run([msrc_frnn_out])[0]
+      self.evaluate(tf.global_variables_initializer())
+      ys = self.evaluate([msrc_frnn_out])[0]
       self.assertEqual(ys.shape, (7, 6, 8))
       print(np.sum(ys, axis=(1, 2)), np.sum(ys, axis=(0, 1)),
             np.sum(ys, axis=(0, 2)))
@@ -1270,10 +1137,10 @@ class LayersTest(LayersTestBase):
 
   def testMultiSourceFRNNWithAttentionSingleSource(self, dtype=tf.float32):
     with self.session(
-        use_gpu=True, config=py_utils.SessionConfig(inline=False)) as sess:
+        use_gpu=True, config=py_utils.SessionConfig(inline=False)):
       p = self._MultiSourceFRNNWithAttentionParams(
           single_source=True, dtype=dtype)
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       (src_encs, src_paddings, inputs,
        paddings) = self._MultiSourceFRNNWithAttentionInputs(
@@ -1283,8 +1150,8 @@ class LayersTest(LayersTestBase):
       frnn_out = tf.concat([a, m], 2)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      ys, = sess.run([frnn_out])
+      self.evaluate(tf.global_variables_initializer())
+      ys, = self.evaluate([frnn_out])
       self.assertEqual(ys.shape, (7, 6, 8))
       print(np.sum(ys, axis=(1, 2)), np.sum(ys, axis=(0, 1)),
             np.sum(ys, axis=(0, 2)))
@@ -1313,7 +1180,7 @@ class LayersTest(LayersTestBase):
 
       p = self._MultiSourceFRNNWithAttentionParams(
           single_source=True, dtype=dtype)
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       (src_encs, src_paddings, inputs,
        paddings) = self._MultiSourceFRNNWithAttentionInputs(
@@ -1332,8 +1199,8 @@ class LayersTest(LayersTestBase):
       grads = tf.gradients(loss, parameters)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      sym_grads = sess.run(grads)
+      self.evaluate(tf.global_variables_initializer())
+      sym_grads = self.evaluate(grads)
       num_grads = [
           test_utils.ComputeNumericGradient(sess, loss, v, delta=1e-5)
           for v in parameters
@@ -1360,7 +1227,7 @@ class LayersTest(LayersTestBase):
         use_gpu=True, config=py_utils.SessionConfig(inline=False)) as sess:
 
       p = self._MultiSourceFRNNWithAttentionParams(dtype=dtype)
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       # Fetch all the parameters.
       w0, b0 = (frnn.theta.cell.wm, frnn.theta.cell.b)
@@ -1390,8 +1257,8 @@ class LayersTest(LayersTestBase):
       grads = tf.gradients(loss, parameters)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      sym_grads = sess.run(grads)
+      self.evaluate(tf.global_variables_initializer())
+      sym_grads = self.evaluate(grads)
       num_grads = [
           test_utils.ComputeNumericGradient(sess, loss, v, delta=1e-5)
           for v in parameters
@@ -1419,7 +1286,7 @@ class LayersTest(LayersTestBase):
 
       p = self._MultiSourceFRNNWithAttentionParams(
           single_source_length=False, dtype=dtype)
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       # Fetch all the parameters.
       w0, b0 = (frnn.theta.cell.wm, frnn.theta.cell.b)
@@ -1453,8 +1320,8 @@ class LayersTest(LayersTestBase):
       grads = tf.gradients(loss, parameters)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      sym_grads = sess.run(grads)
+      self.evaluate(tf.global_variables_initializer())
+      sym_grads = self.evaluate(grads)
       num_grads = [
           test_utils.ComputeNumericGradient(sess, loss, v, delta=1e-5)
           for v in parameters
@@ -1476,8 +1343,15 @@ class LayersTest(LayersTestBase):
       for i, (sym, num) in enumerate(zip(sym_grads, num_grads)):
         Compare(parameters[i].name, sym, num)
 
-  def _CreateFRNNWithAttentionParams(self, dtype, dims, slen, sbatch, tlen,
-                                     tbatch):
+  def _CreateFRNNWithAttentionParams(self,
+                                     dtype,
+                                     dims,
+                                     slen,
+                                     sbatch,
+                                     tlen,
+                                     tbatch,
+                                     input_prev_atten_ctx=True,
+                                     output_prev_atten_ctx=False):
     # Create RNN Layer.
     p = rnn_cell.LSTMCellSimple.Params()
     p.name = 'lstm'
@@ -1486,7 +1360,7 @@ class LayersTest(LayersTestBase):
     p.params_init = py_utils.WeightInit.Uniform(0.02, 429891685)
     p.vn.global_vn = False
     p.vn.per_step_vn = False
-    p.num_input_nodes = dims * 2
+    p.num_input_nodes = dims * 2 if input_prev_atten_ctx else dims
     p.num_output_nodes = dims
     lstm_params = p
 
@@ -1507,10 +1381,14 @@ class LayersTest(LayersTestBase):
     p.dtype = dtype
     p.cell = lstm_params
     p.attention = atten
-    p.output_prev_atten_ctx = False
+    p.input_prev_atten_ctx = input_prev_atten_ctx
+    p.output_prev_atten_ctx = output_prev_atten_ctx
     return p
 
-  def testFRNNWithAttentionSeparateSourceContextIdenticalToSourceEnc(self):
+  @parameterized.parameters((False, False), (False, True), (True, False),
+                            (True, True))
+  def testFRNNWithAttentionSeparateSourceContextIdenticalToSourceEnc(
+      self, input_prev_atten_ctx, output_prev_atten_ctx):
     dtype = tf.float32
     dims = 4
     slen = 10
@@ -1518,8 +1396,7 @@ class LayersTest(LayersTestBase):
     tlen = 7
     tbatch = 6
 
-    with self.session(
-        use_gpu=True, config=py_utils.SessionConfig(inline=True)) as sess:
+    with self.session(use_gpu=True, config=py_utils.SessionConfig(inline=True)):
       np.random.seed(12345)
       p = self._CreateFRNNWithAttentionParams(
           dtype=dtype,
@@ -1527,9 +1404,11 @@ class LayersTest(LayersTestBase):
           slen=slen,
           sbatch=sbatch,
           tlen=tlen,
-          tbatch=tbatch)
+          tbatch=tbatch,
+          input_prev_atten_ctx=input_prev_atten_ctx,
+          output_prev_atten_ctx=output_prev_atten_ctx)
 
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       src_encs = tf.constant(
           np.random.uniform(size=[slen, sbatch, dims]), dtype)
@@ -1552,8 +1431,9 @@ class LayersTest(LayersTestBase):
           [atten_ctx_src_ctx, rnn_out_src_ctx, atten_prob_src_ctx], 2)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      frnn_out_v, frnn_out_src_ctx_v = sess.run([frnn_out, frnn_out_src_ctx])
+      self.evaluate(tf.global_variables_initializer())
+      frnn_out_v, frnn_out_src_ctx_v = self.evaluate(
+          [frnn_out, frnn_out_src_ctx])
 
       # Expected last dimensions for atten_ctx_src_ctx, rnn_out_src_ctx,
       # atten_prob_src_ctx are respectively, (dims, dims, slen).
@@ -1562,7 +1442,10 @@ class LayersTest(LayersTestBase):
 
       self.assertAllClose(frnn_out_v, frnn_out_src_ctx_v)
 
-  def testFRNNWithAttentionSeparateSourceContextDifferentFromSourceEnc(self):
+  @parameterized.parameters((False, False), (False, True), (True, False),
+                            (True, True))
+  def testFRNNWithAttentionSeparateSourceContextDifferentFromSourceEnc(
+      self, input_prev_atten_ctx, output_prev_atten_ctx):
     dtype = tf.float32
     dims = 4
     slen = 10
@@ -1570,8 +1453,7 @@ class LayersTest(LayersTestBase):
     tlen = 7
     tbatch = 6
 
-    with self.session(
-        use_gpu=True, config=py_utils.SessionConfig(inline=True)) as sess:
+    with self.session(use_gpu=True, config=py_utils.SessionConfig(inline=True)):
       np.random.seed(12345)
       p = self._CreateFRNNWithAttentionParams(
           dtype=dtype,
@@ -1579,9 +1461,11 @@ class LayersTest(LayersTestBase):
           slen=slen,
           sbatch=sbatch,
           tlen=tlen,
-          tbatch=tbatch)
+          tbatch=tbatch,
+          input_prev_atten_ctx=input_prev_atten_ctx,
+          output_prev_atten_ctx=output_prev_atten_ctx)
 
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       src_encs = tf.constant(
           np.random.uniform(size=[slen, sbatch, dims]), dtype)
@@ -1602,8 +1486,8 @@ class LayersTest(LayersTestBase):
           src_encs, src_paddings, inputs, paddings, src_contexts=src_contexts)
 
       # Initialize all the variables, and then run one step.
-      tf.global_variables_initializer().run()
-      atten_ctx_v = sess.run(atten_ctx)
+      self.evaluate(tf.global_variables_initializer())
+      atten_ctx_v = self.evaluate(atten_ctx)
 
       self.assertEqual(atten_ctx_v.shape, (tlen, tbatch, dims))
       # Verify that the output also has zeros in the locations that the
@@ -1620,7 +1504,7 @@ class LayersTest(LayersTestBase):
     sbatch = 2
     tbatch = 6
 
-    with self.session(use_gpu=True) as sess:
+    with self.session(use_gpu=True):
       p = self._CreateFRNNWithAttentionParams(
           dtype=dtype,
           dims=dims,
@@ -1630,7 +1514,7 @@ class LayersTest(LayersTestBase):
           tbatch=tbatch)
       p.use_zero_atten_state = True
       p.atten_context_dim = dims
-      frnn = p.cls(p)
+      frnn = p.Instantiate()
 
       # Override the ZeroAttentionState to have the desired output type
       frnn.atten.ZeroAttentionState = types.MethodType(zero_atten_state_fn,
@@ -1646,8 +1530,8 @@ class LayersTest(LayersTestBase):
       atten_ctx, rnn_out, atten_prob, _ = frnn.FPropDefaultTheta(
           src_encs, src_paddings, inputs, paddings)
 
-      tf.global_variables_initializer().run()
-      atten_ctx, rnn_out, atten_prob = sess.run(
+      self.evaluate(tf.global_variables_initializer())
+      atten_ctx, rnn_out, atten_prob = self.evaluate(
           [atten_ctx, rnn_out, atten_prob])
 
       # Check shapes

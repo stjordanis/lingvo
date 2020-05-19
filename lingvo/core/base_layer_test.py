@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,13 +15,11 @@
 # ==============================================================================
 """Tests for base_layer."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
+from lingvo.core import hyperparams
+from lingvo.core import py_utils
+from lingvo.core import test_utils
 
 
 class AddingAccumulator(base_layer.Accumulator):
@@ -36,37 +35,63 @@ def EvalAndFlatten(nmap):
   return nmap.Transform(lambda x: x.eval()).FlattenItems()
 
 
-class BaseLayerTest(tf.test.TestCase):
+class TestLayer(base_layer.BaseLayer):
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(TestLayer, self).__init__(params)
+    p = self.params
+    with tf.variable_scope(p.name):
+      self.CreateVariable(
+          'w',
+          py_utils.WeightParams(
+              shape=[4, 4],
+              dtype=p.dtype,
+              init=p.params_init,
+              collections=[self.__class__.__name__ + '_vars']))
+      self.CreateVariable(
+          'b',
+          py_utils.WeightParams(
+              shape=[4],
+              dtype=p.dtype,
+              init=py_utils.WeightInit.Constant(),
+              collections=[
+                  self.__class__.__name__ + '_vars',
+                  py_utils.SKIP_LP_REGULARIZATION
+              ]))
+
+
+class BaseLayerTest(test_utils.TestCase):
 
   def testCopyBaseParams(self):
-    # CopyBaseParams should only overwrite is_eval/vn setting when target use
-    # default is_eval/vn config.
+    # CopyBaseParams should only overwrite vn setting when target use
+    # default vn config.
     layer_base_p = base_layer.BaseLayer.Params()
     from_param = layer_base_p.Copy()
     to_param = layer_base_p.Copy()
-    from_param.is_eval = False
     from_param.vn.global_vn = True
     from_param.random_seed = 1234
+    from_param.skip_lp_regularization = True
     # Target use default, overwrite.
     base_layer.BaseLayer.CopyBaseParams(from_param, to_param)
-    self.assertEqual(False, to_param.is_eval)
     self.assertTrue(to_param.vn.global_vn)
     self.assertEqual(1234, to_param.random_seed)
+    self.assertTrue(to_param.skip_lp_regularization)
     to_param = layer_base_p.Copy()
-    to_param.is_eval = True
     to_param.vn.per_step_vn = True
     to_param.random_seed = 4321
+    to_param.skip_lp_regularization = False
     # Target does not use default, should not overwrite.
     base_layer.BaseLayer.CopyBaseParams(from_param, to_param)
-    self.assertEqual(True, to_param.is_eval)
     self.assertTrue(to_param.vn.per_step_vn)
     self.assertFalse(to_param.vn.global_vn)
     self.assertEqual(4321, to_param.random_seed)
+    self.assertFalse(to_param.skip_lp_regularization)
 
   def testCreateChildren(self):
     layer_p = base_layer.BaseLayer.Params()
     layer_p.name = 'test'
-    layer = layer_p.cls(layer_p)
+    layer = layer_p.Instantiate()
     layer.CreateChildren('a', [layer_p, [layer_p, layer_p], layer_p])
     self.assertEqual(len(layer.a), 3)
     self.assertEqual(len(layer.a[1]), 2)
@@ -75,10 +100,29 @@ class BaseLayerTest(tf.test.TestCase):
     self.assertEqual(len(layer.theta.a), 3)
     self.assertEqual(len(layer.theta.a[1]), 2)
 
+  def testCreateVariable(self):
+    layer_p = TestLayer.Params().Set(name='test')
+    layer = layer_p.Instantiate()
+    self.assertEqual('test/w/var:0', layer.vars.w.name)
+    self.assertEqual('test/b/var:0', layer.vars.b.name)
+    self.assertNotIn(layer.vars.w,
+                     tf.get_collection(py_utils.SKIP_LP_REGULARIZATION))
+    # 'b' always skips Lp regularization.
+    self.assertIn(layer.vars.b,
+                  tf.get_collection(py_utils.SKIP_LP_REGULARIZATION))
+
+  def testCreateVariableSkipLpRegularization(self):
+    layer_p = TestLayer.Params().Set(name='test', skip_lp_regularization=True)
+    layer = layer_p.Instantiate()
+    self.assertIn(layer.vars.w,
+                  tf.get_collection(py_utils.SKIP_LP_REGULARIZATION))
+    self.assertIn(layer.vars.b,
+                  tf.get_collection(py_utils.SKIP_LP_REGULARIZATION))
+
   def testGetDescendant(self):
     q = base_layer.BaseLayer.Params()
     q.name = 'test'
-    l = q.cls(q)
+    l = q.Instantiate()
     p = base_layer.BaseLayer.Params()
     l.CreateChild('a', p)
     l.CreateChild('b', p)
@@ -95,7 +139,7 @@ class BaseLayerTest(tf.test.TestCase):
   def testCreateAccumulator(self):
     layer_p = base_layer.BaseLayer.Params()
     layer_p.name = 'test'
-    layer = layer_p.cls(layer_p)
+    layer = layer_p.Instantiate()
     layer.CreateChild('child', layer_p)
 
     # First accumulator should succeed.
@@ -124,7 +168,7 @@ class BaseLayerTest(tf.test.TestCase):
     with self.session():
       layer_p = base_layer.BaseLayer.Params()
       layer_p.name = 'test'
-      layer = layer_p.cls(layer_p)
+      layer = layer_p.Instantiate()
 
       layer.RegisterAccumulator('acc1', AddingAccumulator())
 
@@ -144,7 +188,7 @@ class BaseLayerTest(tf.test.TestCase):
     with self.session():
       layer_p = base_layer.BaseLayer.Params()
       layer_p.name = 'test'
-      layer = layer_p.cls(layer_p)
+      layer = layer_p.Instantiate()
 
       layer.RegisterAccumulator('acc1', AddingAccumulator())
       layer.accumulators.acc1.Update(1.0)
@@ -163,7 +207,7 @@ class BaseLayerTest(tf.test.TestCase):
     with self.session():
       layer_p = base_layer.BaseLayer.Params()
       layer_p.name = 'test'
-      layer1 = layer_p.cls(layer_p)
+      layer1 = layer_p.Instantiate()
       layer1.CreateChild('layer1a', layer_p)
       layer1.CreateChild('layer1b', layer_p)
       layer1.layer1b.CreateChild('layer1b1', layer_p)
@@ -213,7 +257,7 @@ class BaseLayerTest(tf.test.TestCase):
   def testAddFunction(self):
     layer_p = base_layer.BaseLayer.Params()
     layer_p.name = 'test'
-    layer = layer_p.cls(layer_p)
+    layer = layer_p.Instantiate()
 
     layer.AddFunction('test1', lambda: 1)
     with self.assertRaises(AttributeError):
@@ -238,13 +282,27 @@ class BaseLayerTest(tf.test.TestCase):
 
     layer_p = BadLayer.Params()
     layer_p.name = 'test'
-    layer = layer_p.cls(layer_p)
+    layer = layer_p.Instantiate()
 
-    with self.assertRaisesRegexp(AttributeError, 'bad_sub_layer'):
+    with self.assertRaisesRegex(AttributeError, 'bad_sub_layer'):
       _ = layer.bad_sub_layer
 
-    with self.assertRaisesRegexp(AttributeError, 'INTERNAL'):
+    with self.assertRaisesRegex(AttributeError, 'INTERNAL'):
       _ = layer.bad_property
+
+  def testIsLayerParams(self):
+    self.assertTrue(base_layer.IsLayerParams(base_layer.BaseLayer.Params()))
+    self.assertTrue(base_layer.IsLayerParams(TestLayer.Params()))
+    self.assertFalse(base_layer.IsLayerParams(None))
+    self.assertFalse(base_layer.IsLayerParams(hyperparams.Params()))
+    self.assertFalse(
+        base_layer.IsLayerParams(
+            hyperparams.InstantiableParams(base_layer.Accumulator)))
+
+  def testDefaultVnParams(self):
+    default_vn = base_layer.DefaultVN()
+    disable_vn = py_utils.DisableVN()
+    self.assertNotEqual(default_vn, disable_vn)
 
 
 if __name__ == '__main__':

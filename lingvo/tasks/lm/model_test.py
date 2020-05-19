@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,23 +15,17 @@
 # ==============================================================================
 """Tests for lm.model."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import os
-
-from six.moves import range
-
-import tensorflow as tf
+import lingvo.compat as tf
 from lingvo.core import test_helper
 from lingvo.core import test_utils
 from lingvo.core import tokenizers
 from lingvo.tasks.lm import input_generator
 from lingvo.tasks.lm import model
+from six.moves import range
 
 
-class ModelTest(tf.test.TestCase):
+class ModelTest(test_utils.TestCase):
 
   def _InputParams(self, for_training):
     p = input_generator.LmInput.Params()
@@ -66,20 +61,20 @@ class ModelTest(tf.test.TestCase):
     return p
 
   def testLmFprop(self):
-    tf.set_random_seed(93820986)
+    tf.random.set_seed(93820986)
     p = self._Params()
     p.input = self._InputParams(for_training=False)
 
-    with self.session(use_gpu=False) as sess:
-      mdl = p.cls(p)
+    with self.session(use_gpu=False):
+      mdl = p.Instantiate()
       mdl.FPropDefaultTheta()
       loss = mdl.eval_metrics['loss'][0]
       logp = mdl.eval_metrics['log_pplx'][0]
       logp_per_word = mdl.eval_metrics['log_pplx_per_word'][0]
       accuracy = mdl.eval_metrics['fraction_of_correct_next_step_preds'][0]
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
-      loss, logp, logp_per_word, accuracy = sess.run(
+      loss, logp, logp_per_word, accuracy = self.evaluate(
           [loss, logp, logp_per_word, accuracy])
       test_utils.CompareToGoldenSingleFloat(self, 4.160992, loss)
       test_utils.CompareToGoldenSingleFloat(self, 4.160992, logp)
@@ -92,33 +87,33 @@ class ModelTest(tf.test.TestCase):
     tp = p.train
     tp.learning_rate = 3e-3
 
-    with self.session() as sess:
-      mdl = p.cls(p)
+    with self.session():
+      mdl = p.Instantiate()
       mdl.FPropDefaultTheta()
       mdl.BProp()
       loss = mdl.eval_metrics['loss'][0]
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
 
       # Run some steps and we expect the loss goes down.
-      loss_val, _ = sess.run([loss, mdl.train_op])
+      loss_val, _ = self.evaluate([loss, mdl.train_op])
       self.assertGreater(loss_val, 4.0)
       for i in range(10):
-        loss_val, _ = sess.run([loss, mdl.train_op])
+        loss_val, _ = self.evaluate([loss, mdl.train_op])
         tf.logging.info('%d loss = %f', i, loss_val)
       self.assertLess(loss_val, 3.8)
 
   def testLmInference(self):
-    tf.set_random_seed(93820986)
+    tf.random.set_seed(93820986)
     p = self._Params()
     p.input = self._InputParams(for_training=False)
     tf.logging.info('Params: %s', p.ToText())
 
     with self.session(use_gpu=False) as sess:
-      mdl = p.cls(p)
+      mdl = p.Instantiate()
       subgraphs = mdl.Inference()
-      self.assertTrue('default' in subgraphs)
+      self.assertIn('default', subgraphs)
       fetches, feeds = subgraphs['default']
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
       vals = sess.run(
           fetches=fetches,
           feed_dict={feeds['text']: ['pray for world peace', 'happy birthday']})
@@ -128,7 +123,7 @@ class ModelTest(tf.test.TestCase):
       self.assertEqual(vals['paddings'].shape, (2, 20))
 
   def testLmInferenceWordLevel(self):
-    tf.set_random_seed(93820986)
+    tf.random.set_seed(93820986)
     p = self._Params()
     p.input = self._InputParams(for_training=False)
     p.input.tokenizer = tokenizers.VocabFileTokenizer.Params()
@@ -144,11 +139,11 @@ class ModelTest(tf.test.TestCase):
     tf.logging.info('Params: %s', p.ToText())
 
     with self.session(use_gpu=False) as sess:
-      mdl = p.cls(p)
+      mdl = p.Instantiate()
       subgraphs = mdl.Inference()
-      self.assertTrue('default' in subgraphs)
+      self.assertIn('default', subgraphs)
       fetches, feeds = subgraphs['default']
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
       vals = sess.run(
           fetches=fetches,
           feed_dict={
@@ -161,7 +156,8 @@ class ModelTest(tf.test.TestCase):
       self.assertEqual(vals['log_pplx_per_token'].shape, (3, 5))
       self.assertEqual(vals['paddings'].shape, (3, 5))
       expected_tokens_from_labels = [
-          '<UNK> for more <UNK> </S>', '<UNK> about </S>', 'one <UNK> will </S>'
+          b'<UNK> for more <UNK> </S>', b'<UNK> about </S>',
+          b'one <UNK> will </S>'
       ]
       self.assertListEqual(vals['tokens_from_labels'].tolist(),
                            expected_tokens_from_labels)

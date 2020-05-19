@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,20 +19,121 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import copy
 import math
-import numpy as np
-import six
-from six.moves import range
-import tensorflow as tf
-
-from tensorflow.python.framework import function
-from tensorflow.python.ops import functional_ops
-from tensorflow.python.ops import inplace_ops
+import numbers
+import lingvo.compat as tf
 from lingvo.core import base_layer
+from lingvo.core import builder_layers
+from lingvo.core import bn_layers
+from lingvo.core import computation_cost
+from lingvo.core import constants
+from lingvo.core import conv_layers_with_time_padding
 from lingvo.core import py_utils
 from lingvo.core import quant_utils
 from lingvo.core import recurrent
+from lingvo.core import schedule
 from lingvo.core import summary_utils
+from lingvo.core import symbolic
+from lingvo.core import tshape
+import numpy as np
+import six
+from six.moves import range
+from six.moves import zip
+import sympy
+
+from tensorflow.python.ops import functional_ops
+from tensorflow.python.ops import inplace_ops
+from tensorflow.python.tpu import tpu_embedding as tpu_embedding_lib
+
+
+class DeconvLayer(base_layer.BaseLayer):
+  """Deconv (transposed conv2d) layer.
+
+  DeconvLayer is different from ConvTransposeLayer in that
+  DeconvLayer does not support padding and biasing. Hence,
+  it's simpler and more basic than ConvTransposeLayer.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(DeconvLayer, cls).Params()
+    p.Define(
+        'filter_shape', (0, 0, 0, 0),
+        'Filter shape. Must be a sequence of length 4. Elements are in'
+        ' the order of height, width, out_channel, in_channel.')
+    p.Define(
+        'filter_stride', (0, 0),
+        'Filter stride to use. Must be a pair of ints. The first int'
+        ' specifies the stride on the height dimension. The second int'
+        ' specifies the stride on the width dimension.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(DeconvLayer, self).__init__(params)
+    p = self.params
+    assert p.name
+    assert len(p.filter_shape) == 4
+    assert len(p.filter_stride) == 2
+    assert all(x > 0 for x in p.filter_shape)
+    assert all(x > 0 for x in p.filter_stride)
+    w_pc = py_utils.WeightParams(
+        shape=p.filter_shape,
+        init=p.params_init,
+        dtype=p.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+    with tf.variable_scope(p.name):
+      self.CreateVariable('w', w_pc)
+
+  def OutShape(self, in_shape):
+    """Compute the output shape given the input shape."""
+    p = self.params
+    t_stride = p.filter_stride[0]
+    f_stride = p.filter_stride[1]
+    return tf.stack([
+        in_shape[0], in_shape[1] * t_stride, in_shape[2] * f_stride,
+        p.filter_shape[2]
+    ])
+
+  def _ApplyConv(self, theta, inputs):
+    p = self.params
+    w = theta.w
+    strides = [1, p.filter_stride[0], p.filter_stride[1], 1]
+    # TODO(miachen): remove casting once tf.nn.conv2d supports tf.float64.
+    assert inputs.dtype == w.dtype
+    dtype = inputs.dtype
+    if dtype != tf.float32:
+      inputs = tf.cast(inputs, tf.float32)
+      w = tf.cast(w, tf.float32)
+    # TODO(zhifengc): Try some better way to do Deconv. Search for
+    # "resize-convolution".
+    out = tf.nn.conv2d_transpose(
+        inputs,
+        w,
+        output_shape=self.OutShape(tf.shape(inputs)),
+        strides=strides,
+        padding='SAME')
+    if dtype != tf.float32:
+      out = tf.cast(out, dtype)
+    return py_utils.HasShape(out, [-1, -1, -1, p.filter_shape[2]])
+
+  def FProp(self, theta, inputs):
+    """Apply deconvolution to inputs.
+
+    Args:
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
+      inputs: The inputs tensor. It is expected to be of shape [batch, height,
+        width, channel].
+
+    Returns:
+      outputs. outputs is expected to have shape [batch, height * height_stride,
+      width * width_stride, out_channel].
+    """
+    p = self.params
+    inputs = py_utils.HasShape(inputs, [-1, -1, -1, p.filter_shape[3]])
+    return self._ApplyConv(theta, inputs)
 
 
 def Gelu(input_tensor):
@@ -46,8 +148,8 @@ def Gelu(input_tensor):
   Returns:
     `input_tensor` with the GELU activation applied.
   """
-  cdf = 0.5 * (
-      1.0 + tf.erf(input_tensor / tf.cast(tf.sqrt(2.0), input_tensor.dtype)))
+  cdf = 0.5 * (1.0 + tf.math.erf(
+      input_tensor / tf.cast(tf.sqrt(2.0), input_tensor.dtype)))
   return input_tensor * cdf
 
 
@@ -57,7 +159,9 @@ _ACTIVATIONS = {
     'RELU6': tf.nn.relu6,
     'SIGMOID': tf.sigmoid,
     'TANH': tf.tanh,
-    'GELU': Gelu
+    'GELU': Gelu,
+    'SWISH': tf.nn.swish,
+    'SOFTPLUS': tf.nn.softplus,
 }
 
 # A subset of activation functions are supported by TFLite as fused activation
@@ -99,301 +203,13 @@ class IdentityLayer(base_layer.BaseLayer):
     return py_utils.NestedMap(flops=0, out_shapes=(inputs,))
 
 
-class BatchNormLayer(base_layer.BaseLayer):
-  """Batch normalization layer."""
-
-  @classmethod
-  def Params(cls):
-    p = super(BatchNormLayer, cls).Params()
-    p.Define('dim', 0, 'Depth of the input/output.')
-    p.Define(
-        'decay', 0.999,
-        'Decay in updating the mean and variance moving average used in'
-        ' batch normalization.')
-    p.Define(
-        'enable_cross_replica_sum_on_tpu', True,
-        'If true, calls cross_replica_sum to the aggregate moving averages'
-        ' across all replicas.')
-    p.Define(
-        'use_moving_avg_in_training', False,
-        'If True, use global moving avg (mean, variance) during training'
-        ' to avoid mismatch between train and eval, which then'
-        ' essentially acts as an adaptive normalization step.')
-    return p
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(BatchNormLayer, self).__init__(params)
-    p = self.params
-    assert p.name
-
-    pc = py_utils.WeightParams(
-        shape=[p.dim],
-        init=py_utils.WeightInit.Constant(0.0),
-        dtype=p.dtype,
-        collections=[self.__class__.__name__ + '_vars'])
-
-    with tf.variable_scope(p.name):
-      if not p.use_moving_avg_in_training:
-        self.CreateVariable('beta', pc)
-        # Note, The real gamma to use is 1 + gamma.
-        self.CreateVariable('gamma', pc, lambda x: 1.0 + x)
-
-      # Two statistics.
-      _, self._moving_mean = py_utils.CreateVariable(
-          'moving_mean', pc, trainable=False)
-
-      pc = py_utils.WeightParams(
-          shape=[p.dim],
-          init=py_utils.WeightInit.Constant(1.0),
-          dtype=p.dtype,
-          collections=[self.__class__.__name__ + '_vars'])
-      _, self._moving_variance = py_utils.CreateVariable(
-          'moving_variance', pc, trainable=False)
-    self._epsilon = 0.001
-    self._decay = p.decay
-
-  @property
-  def epsilon(self):
-    return self._epsilon
-
-  @staticmethod
-  def _Moments(inputs, mask, enable_cross_replica_sum_on_tpu=False):
-    """Computes mean and variance over the valid data points in inputs."""
-    inputs = py_utils.with_dependencies([
-        py_utils.assert_equal(tf.rank(inputs), tf.rank(mask)),
-        py_utils.assert_greater_equal(mask, tf.zeros_like(mask)),
-    ], inputs)
-    rank = tf.rank(mask)
-    reduce_over_dims = tf.range(0, rank - 1)
-    sum_v = tf.reduce_sum(inputs * tf.cast(mask, inputs.dtype),
-                          reduce_over_dims)
-    count_v = tf.reduce_sum(mask, reduce_over_dims)
-    # Input shape is guaranteed to be a multiple of mask shape because the
-    # inputs * mask op above was successfully broadcasted.
-    mask_multiplier = tf.shape(inputs)[:-1] // tf.shape(mask)[:-1]
-    count_v *= tf.cast(tf.reduce_prod(mask_multiplier), count_v.dtype)
-    if py_utils.use_tpu() and enable_cross_replica_sum_on_tpu:
-      sum_v = tf.contrib.tpu.cross_replica_sum(sum_v)
-      count_v = tf.contrib.tpu.cross_replica_sum(count_v)
-
-    count_v = tf.maximum(count_v, 1.0)
-    mean = sum_v / count_v
-    sum_vv = tf.reduce_sum((inputs - mean) * (inputs - mean) * mask,
-                           reduce_over_dims)
-
-    if py_utils.use_tpu() and enable_cross_replica_sum_on_tpu:
-      sum_vv = tf.contrib.tpu.cross_replica_sum(sum_vv)
-
-    variance = py_utils.with_dependencies([
-        py_utils.assert_greater_equal(sum_vv, tf.zeros_like(sum_vv)),
-    ], sum_vv / count_v)
-    return mean, variance
-
-  def _GetDefaultPaddings(self, inputs):
-    """Gets the default paddings for an input."""
-    return tf.zeros(
-        tf.concat([tf.shape(inputs)[:-1], [1]], 0), dtype=inputs.dtype)
-
-  def GetCurrentMoments(self, theta):
-    """Gets the current computed moments, which should be applied at eval.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.  Shaped [..., dim].
-      paddings: The paddings tensor.  Shaped [..., 1], with the same rank as the
-        input tensor.
-
-    Returns:
-      Tuple of (mean, variance, beta, gamma).
-    """
-    p = self.params
-    if p.use_moving_avg_in_training:
-      return self._moving_mean, self._moving_variance, 0.0, 1.0
-    else:
-      return self._moving_mean, self._moving_variance, theta.beta, theta.gamma
-
-  def ComputeAndUpdateMoments(self, theta, inputs, paddings=None):
-    """Computes moments and updates state.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.  Shaped [..., dim].
-      paddings: The paddings tensor.  Shaped [..., 1], with the same rank as the
-        input tensor.
-
-    Returns:
-      Tuple of (mean, variance, beta, gamma).
-    """
-    p = self.params
-    if paddings is None:
-      paddings = self._GetDefaultPaddings(inputs)
-    inputs = py_utils.with_dependencies([
-        py_utils.assert_shape_match([tf.shape(inputs)[-1]], [p.dim]),
-        py_utils.assert_shape_match([tf.shape(paddings)[-1]], [1]),
-    ], inputs)
-    with tf.name_scope(p.name):
-      if p.is_eval:
-        # The mean and variance used for normalization.
-        norm_mean, norm_variance = self._moving_mean, self._moving_variance
-      else:
-        mean, variance = self._Moments(inputs, 1.0 - paddings,
-                                       p.enable_cross_replica_sum_on_tpu)
-
-        py_utils.UpdateBatchNormVars(self._moving_mean, mean, self._decay)
-        py_utils.UpdateBatchNormVars(self._moving_variance, variance,
-                                     self._decay)
-        # Add some summaries for visualization.
-        summary_utils.histogram('%s_mean' % p.name, tf.cast(mean, tf.float32))
-        summary_utils.histogram('%s_variance' % p.name,
-                                tf.cast(variance, tf.float32))
-        summary_utils.histogram('%s_moving_mean' % p.name,
-                                tf.cast(self._moving_mean, tf.float32))
-        summary_utils.histogram('%s_moving_variance' % p.name,
-                                tf.cast(self._moving_variance, tf.float32))
-        summary_utils.histogram('%s_mean_diff' % p.name,
-                                tf.cast(mean - self._moving_mean, tf.float32))
-        summary_utils.histogram(
-            '%s_variance_diff' % p.name,
-            tf.cast(variance - self._moving_variance, tf.float32))
-        if p.use_moving_avg_in_training:
-          # Use the global statistics for normalization.
-          # Control dependencies on mean and variance make sure
-          # moving_mean and variance will be updated for every training step.
-          norm_mean = py_utils.with_dependencies([mean], self._moving_mean)
-          norm_variance = py_utils.with_dependencies([variance],
-                                                     self._moving_variance)
-        else:
-          # Use the batch statistics for normalization.
-          norm_mean = mean
-          norm_variance = variance
-
-      norm_mean = py_utils.CheckNumerics(
-          norm_mean, 'mean of %s failed numeric check' % p.name)
-      norm_variance = py_utils.CheckNumerics(
-          norm_variance, 'variance of %s failed numeric check' % p.name)
-
-      if p.use_moving_avg_in_training:
-        beta = 0.0
-        gamma = 1.0
-      else:
-        beta = theta.beta
-        gamma = theta.gamma
-      return norm_mean, norm_variance, beta, gamma
-
-  def FProp(self, theta, inputs, paddings=None):
-    """Apply batch normalization.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.  Shaped [..., dim].
-      paddings: The paddings tensor.  Shaped [..., 1], with the same rank as the
-        input tensor.
-
-    Returns:
-      Output after applying batch normalization, with the same shape as
-      'inputs'.
-    """
-    p = self.params
-    if paddings is None:
-      paddings = self._GetDefaultPaddings(inputs)
-    with tf.name_scope(p.name):
-      norm_mean, norm_variance, beta, gamma = self.ComputeAndUpdateMoments(
-          theta, inputs, paddings)
-      with tf.control_dependencies([
-          py_utils.assert_greater_equal(norm_variance,
-                                        tf.zeros_like(norm_variance)),
-          py_utils.assert_shape_match([p.dim], tf.shape(norm_mean)),
-          py_utils.assert_shape_match([p.dim], tf.shape(norm_variance)),
-      ]):
-        bn_output = tf.nn.batch_normalization(inputs, norm_mean, norm_variance,
-                                              beta, gamma, self._epsilon)
-      bn_output *= 1.0 - paddings
-      return bn_output
-
-  @classmethod
-  def FPropMeta(cls, p, inputs, padding=None):
-    py_utils.CheckShapes((inputs,))
-    flops_per_element = 10  # Approximately 10 flops per element.
-    return py_utils.NestedMap(
-        flops=inputs.num_elements() * flops_per_element, out_shapes=(inputs,))
-
-
-def _ComputeConvOutputShape(in_shape,
-                            t_stride,
-                            f_stride,
-                            outc=None,
-                            padding='SAME'):
-  """Computes output shape for convolution and pooling layers.
-
-  If `in_shape` is a dynamic shape, the output will be Tensors, while if
-  `in_shape` is a list of ints then the output will also be a list of ints.
-
-  Args:
-    in_shape: A length 4 Tensor or list representing the input shape.
-    t_stride: The stride along the time dimension.
-    f_stride: The stride along the frequency dimension.
-    outc: The expected output channel. If None, will use the input channel.
-    padding: 'SAME' or 'VALID'.
-
-  Returns:
-    The expected output shape.
-  """
-  # In the order of batch, time, frequency, channel
-  n = in_shape[0]
-  t = in_shape[1]
-  f = in_shape[2]
-  c = in_shape[3]
-  # Last two dimensions has to be specified.
-  assert f is not None and c is not None
-  if padding == 'VALID':
-    if t:
-      t -= t_stride - 1
-    f -= f_stride - 1
-  ot = t
-  if ot is not None:
-    ot = (ot + t_stride - 1) // t_stride
-  of = (f + f_stride - 1) // f_stride
-  if outc is None:
-    outc = c
-  return [n, ot, of, outc]
-
-
-def _ComputeConvOutputPadding(paddings,
-                              window,
-                              stride,
-                              padding_algorithm='SAME'):
-  """Computes paddings for convolution and pooling output.
-
-  out_padding[i] == 1 iff any in_padding corresponding to that output is 1.
-
-  Args:
-    paddings: The paddings tensor. It is expected to be of shape [batch, time].
-    window: The size of the windows.
-    stride: The time-stride between adjacent windows.
-    padding_algorithm: 'SAME' or 'VALID'.
-
-  Returns:
-    out_padding, The new padding tensor of size [batch, ceil(time / stride)].
-  """
-  if stride == 1:
-    return paddings
-
-  # Pad so input_length divides stride.
-  input_length = tf.shape(paddings)[1]
-  pad_len = (input_length + stride - 1) // stride * stride - input_length
-  paddings = tf.pad(paddings, [[0, 0], [0, pad_len]], constant_values=1.0)
-  out_padding = tf.nn.pool(
-      tf.expand_dims(paddings, -1),
-      [window],
-      'MAX',
-      padding_algorithm,
-      strides=[stride],
-  )
-  return tf.squeeze(out_padding, -1)
+# TODO(yonghui/jonathanasdf): Remove the forwarded links.
+_ComputeConvOutputShape = conv_layers_with_time_padding.ComputeConvOutputShape
+_ComputeConvOutputPadding = (
+    conv_layers_with_time_padding.ComputeConvOutputPadding)
+BatchNormLayer = bn_layers.BatchNormLayer
+BatchNormLayerNoPadding = bn_layers.BatchNormLayerNoPadding
+AddingAccumulator = bn_layers.AddingAccumulator
 
 
 class BaseConv2DLayer(quant_utils.QuantizableLayer):
@@ -474,7 +290,6 @@ class BaseConv2DLayer(quant_utils.QuantizableLayer):
     assert len(p.filter_shape) == 4
     assert len(p.filter_stride) == 2
     assert len(p.dilation_rate) == 2
-    assert all(x > 0 for x in p.filter_shape)
     assert all(x > 0 for x in p.filter_stride)
     assert all(x > 0 for x in p.dilation_rate)
     if any(x > 1 for x in p.dilation_rate):
@@ -627,7 +442,8 @@ class BaseConv2DLayer(quant_utils.QuantizableLayer):
     if p.bias:
       b = theta.b
     else:
-      b = tf.zeros([self.output_channels], dtype=filter_w.dtype)
+      b = tf.zeros([symbolic.ToStatic(self.output_channels)],
+                   dtype=filter_w.dtype)
 
     # Pass-through if weights are not folded with batch normalization.
     if not self._is_bn_folded:
@@ -636,7 +452,7 @@ class BaseConv2DLayer(quant_utils.QuantizableLayer):
     # If batch norm is fused with weights, then compute the weights as from
     # figure C.8 of https://arxiv.org/pdf/1712.05877.pdf for training and
     # figure C.6 for eval.
-    if p.is_eval:
+    if self.do_eval:
       # Gets current moments without updating.
       mean, variance, beta, gamma = self.bn.GetCurrentMoments(theta.bn)
     else:
@@ -647,7 +463,7 @@ class BaseConv2DLayer(quant_utils.QuantizableLayer):
 
     # Fold weights and bias. Note that this layer's bias is not used (not
     # applicable for batch norm case).
-    sigma_recip = tf.rsqrt(variance + self.bn.epsilon)
+    sigma_recip = tf.math.rsqrt(variance + self.bn.epsilon)
     scale_correction = gamma * sigma_recip
     # Normal conv will have all weights in the last dim
     # ([_, _, _, output_channels]), which matches the 1D layout from
@@ -669,16 +485,39 @@ class BaseConv2DLayer(quant_utils.QuantizableLayer):
 
     padding_algorithm = 'SAME'
     if p.causal_convolution:
-      assert p.filter_shape[1] == 1, 'Only 1D causal convolutions supported.'
+      # Causal convolution is only applied in time (height) dimension.
       # Use VALID padding and shift the inputs to the right to ensure that the
       # first output only depends on the first input and so on. The output is
       # the same size as the input, as if the convolution used SAME padding.
       padding_algorithm = 'VALID'
-      # The effective spatial filter width for dilated convolutions is
-      # (kernel_width - 1) * dilation_rate + 1 as according to
+      # The effective spatial filter size for dilated convolutions is
+      # (kernel - 1) * dilation_rate + 1 as according to
       # https://www.tensorflow.org/api_docs/python/tf/nn/convolution.
       causal_pad_size = (p.filter_shape[0] - 1) * p.dilation_rate[0]
-      inputs = tf.pad(inputs, [[0, 0], [causal_pad_size, 0], [0, 0], [0, 0]])
+
+      # Apply padding in width dimension to mimic SAME padding.
+      # Using the similar logic as above to produce the same number of output
+      # as if SAME padding is used.
+      width_pad_size = (p.filter_shape[1] - 1) * p.dilation_rate[1]
+
+      # The amount of padding on the left is tricky. If stride > 1, total
+      # padding required for SAME padding would be:
+      #   pad = ceil(input_size / stride - 1) * stride + eff_kernel - input_size
+      # where eff_kernel = (kernel - 1) * dilation_rate + 1
+      # TensorFlow also pads more on the right / bottom side if total padding
+      # required is an odd number, so pad_left = pad // 2
+      # Therefore pad_left could depend on input size, which might be dynamic.
+      # Here we only handle two special cases where 1) stride = 1, then
+      #   pad_left = (eff_kernel - 1) // 2
+      # and 2) kernel = 1, then
+      #   pad_left = 0
+      if p.filter_stride[1] > 1 and p.filter_shape[1] > 1:
+        raise ValueError('Causal convolution only supports width stride = 1 '
+                         'or filter width = 1.')
+      width_pad_left = max(0, width_pad_size - 1) // 2
+      width_pad_right = width_pad_size - width_pad_left
+      inputs = tf.pad(inputs, [[0, 0], [causal_pad_size, 0],
+                               [width_pad_left, width_pad_right], [0, 0]])
 
     # Lambda for computing the actual convolution.
     def ComputeRawConvolution(filter_w):
@@ -758,8 +597,8 @@ class BaseConv2DLayer(quant_utils.QuantizableLayer):
         # NOTE: this may be slightly inaccurate when p.dilation_rate[0] > 1.
         # But there's likely no real problems. Trying to set it gives an error:
         # pooling with SAME padding is not implemented for dilation_rate > 1.
-        # NOTE: we use window=p.filter_stride[0] to be compatible with legacy
-        # implementation.  Consider updating it to be the actual shape.
+        # NOTE: window=p.filter_stride[0] means output i will be padded if any
+        # input in the stride between the two conv centers are padded.
         conv_padding = _ComputeConvOutputPadding(
             paddings, window=p.filter_stride[0], stride=p.filter_stride[0])
 
@@ -780,7 +619,8 @@ class BaseConv2DLayer(quant_utils.QuantizableLayer):
             out,
             use_select=p.is_inference and p.qdomain.default is not None)
 
-      out = py_utils.HasShape(out, BaseConv2DLayer.OutShape(self, input_shape))
+      out = py_utils.HasShape(
+          out, symbolic.ToStatic(BaseConv2DLayer.OutShape(self, input_shape)))
       return out, conv_padding
 
   def _Compute(self, theta, inputs, paddings, conv_padding):
@@ -855,9 +695,30 @@ class Conv2DLayer(BaseConv2DLayer):
         inputs,
         filter_w,
         strides=strides,
-        dilation_rate=p.dilation_rate,
+        dilations=p.dilation_rate,
         data_format='NHWC',
         padding=padding_algorithm)
+
+
+class ConvNN2DLayer(BaseConv2DLayer):
+  """Convolution layer, based on tf.nn.conv2d instead of tf.nn.convolution.
+
+  tf.nn.convolution is using a different implementation on atrous convolutions,
+  by wrapping the actual convolution with space_to_batch and batch_to_space.
+  This implementation is not supported in tflite conversion, hence we need
+  a different layer for using atrous convolutions.
+  """
+
+  def _EvaluateConvKernel(self, inputs, filter_w, strides, dilation_rate,
+                          padding_algorithm, data_format):
+    p = self.params
+    return tf.nn.conv2d(
+        inputs,
+        filter_w,
+        strides=strides,
+        dilations=p.dilation_rate,
+        data_format='NHWC',
+        padding='SAME')
 
 
 # Alias of Conv2DLayer (for compatibility with historical uses).
@@ -906,7 +767,7 @@ class DepthwiseConv2DLayer(BaseConv2DLayer):
         inputs,
         filter=filter_w,
         strides=[1, strides[0], strides[1], 1],
-        rate=p.dilation_rate,
+        dilations=p.dilation_rate,
         data_format='NHWC',
         padding=padding_algorithm)
 
@@ -999,7 +860,7 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
         'activation', 'RELU',
         'Activation function to use. Options are RELU, RELU6, SIGMOID, '
         'TANH, NONE.')
-    p.Define('batch_norm', True, 'Whether or not to apply batch norm.')
+    p.Define('batch_norm', None, 'Whether or not to apply batch norm.')
     p.Define('has_bias', False,
              'Whether or not to introduce the bias params to the layer.')
     p.Define('bias_init', 0.0, 'Initial value for the bias')
@@ -1021,6 +882,15 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
         'Defaults to None which means that it will be disabled by default '
         'and enabled when quantized training is enabled. Not compatible with '
         'affine_last=True')
+    p.Define('bn_params',
+             BatchNormLayer.Params().Set(decay=0.999),
+             'Default params for batch norm layer.')
+    p.Define('apply_pruning', False,
+             'Whether to prune the weights while training')
+    p.Define(
+        'use_einsum', False, 'Whether to use tf.einsum for optimizing '
+        'computations. Might cause problems with model quantization for on '
+        'device inference b/146421936.')
     return p
 
   @base_layer.initializer
@@ -1028,9 +898,12 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
     super(ProjectionLayer, self).__init__(params)
     p = self.params
     assert p.name
-    assert p.input_dim > 0
-    assert p.output_dim > 0
+    assert symbolic.EvalExpr(symbolic.STATIC_VALUES, p.input_dim) > 0
+    assert symbolic.EvalExpr(symbolic.STATIC_VALUES, p.output_dim) > 0
     assert p.activation == 'NONE' or p.activation in _ACTIVATIONS
+    if p.batch_norm is None:
+      raise RuntimeError(
+          'ProjectionLayer.batch_norm not set explicitly for %s' % self.path)
     if p.batch_norm and p.has_bias:
       tf.logging.warning(
           'Projection layer enables both batch_norm and has_bias. '
@@ -1044,6 +917,14 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
         init=p.params_init,
         dtype=p.dtype,
         collections=[self.__class__.__name__ + '_vars'])
+
+    if p.apply_pruning:
+      mask_w_pc = py_utils.WeightParams(w_pc.shape,
+                                        py_utils.WeightInit.Constant(1.0),
+                                        p.dtype)
+      threshold_w_pc = py_utils.WeightParams([],
+                                             py_utils.WeightInit.Constant(0.0),
+                                             tf.float32)
     if p.has_bias:
       b_pc = py_utils.WeightParams(
           shape=[p.output_dim],
@@ -1056,8 +937,30 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
           init=py_utils.WeightInit.Constant(0.0),
           dtype=p.dtype,
           collections=[self.__class__.__name__ + '_vars'])
+
     with tf.variable_scope(p.name):
-      self.CreateVariable('w', w_pc)
+      weights_var_name = 'w'
+      if p.apply_pruning:
+        mask_var_name = 'mask'
+        threshold_var_name = 'threshold'
+        self.CreateVariable(
+            mask_var_name, mask_w_pc, theta_fn=None, trainable=False)
+        self.CreateVariable(
+            threshold_var_name, threshold_w_pc, theta_fn=None, trainable=False)
+
+        def MaskWeightFn(weight):
+          return tf.multiply(
+              self.AddGlobalVN(weight), getattr(self.vars, mask_var_name),
+              'masked_w')
+
+        self.CreateVariable(weights_var_name, w_pc, theta_fn=MaskWeightFn)
+        py_utils.AddToPruningCollections(
+            getattr(self.vars, weights_var_name),
+            getattr(self.vars, mask_var_name),
+            getattr(self.vars, threshold_var_name))
+      else:
+        self.CreateVariable(weights_var_name, w_pc)
+
       if p.has_bias:
         self.CreateVariable('b', b_pc)
       if p.weight_norm:
@@ -1079,12 +982,16 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
       self.TrackQTensor(self._pre_activation_qt_name)
 
     if p.batch_norm:
-      bn_params = BatchNormLayer.Params().Set(
-          dim=p.input_dim if p.affine_last else p.output_dim,
-          decay=0.999,
-          name=p.name)
+      bn_params = p.bn_params.Copy()
+      bn_params.name = p.name
+      bn_params.dim = p.input_dim if p.affine_last else p.output_dim
+
       self.CreateChild('bn', bn_params)
     # TODO(yonghui): implement the variational noise logic.
+
+  @classmethod
+  def NumOutputNodes(cls, p):
+    return p.output_dim
 
   @property
   def output_qt_name(self):
@@ -1177,14 +1084,14 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
     b = theta.b if p.has_bias else None
     if p.weight_norm:
       w = tf.reshape((theta.g + 1.0) * tf.nn.l2_normalize(w, [0]),
-                     [p.input_dim, p.output_dim])
+                     py_utils.ToStaticShape([p.input_dim, p.output_dim]))
     if not self._is_bn_folded:
       return w, b
 
     # If batch norm is fused with weights, then compute the weights as from
     # figure C.8 of https://arxiv.org/pdf/1712.05877.pdf for training and
     # figure C.6 for eval.
-    if p.is_eval:
+    if self.do_eval:
       # Gets current moments without updating.
       mean, variance, beta, gamma = self.bn.GetCurrentMoments(theta.bn)
     else:
@@ -1196,7 +1103,7 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
           theta.bn, raw_output, paddings)
 
     # Fold weights and bias.
-    sigma_recip = tf.rsqrt(variance + self.bn.epsilon)
+    sigma_recip = tf.math.rsqrt(variance + self.bn.epsilon)
     scale_correction = gamma * sigma_recip
     w = w * scale_correction
     b = beta - (gamma * mean * sigma_recip)
@@ -1228,7 +1135,13 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
       Output tensor reshaped.
     """
     p = self.params
-    out = py_utils.Matmul(tf.reshape(inputs, [-1, p.input_dim]), w)
+
+    if p.use_einsum:
+      out = py_utils.ProjectLastDim(inputs, w, p.input_dim, p.output_dim)
+    else:
+      out = py_utils.Matmul(
+          tf.reshape(inputs, py_utils.ToStaticShape([-1, p.input_dim])), w)
+
     if b is not None:
       out += b  # NOTE: Bias on matmul is never quantized.
     if with_activation and p.activation != 'NONE':
@@ -1240,9 +1153,14 @@ class ProjectionLayer(quant_utils.QuantizableLayer):
       out = _ACTIVATIONS[p.activation](out)
     if quant:
       out = self.QTensor(self._output_qt_name, out)
-    out = tf.reshape(
-        out, tf.concat([py_utils.GetShape(inputs)[:-1], [p.output_dim]],
-                       axis=0))
+    if not p.use_einsum:
+      out = tf.reshape(
+          out,
+          tf.concat([
+              py_utils.GetShape(inputs)[:-1],
+              py_utils.ToStaticShape([p.output_dim])
+          ],
+                    axis=0))
     return out
 
 
@@ -1255,6 +1173,364 @@ class FCLayer(ProjectionLayer):
     p.batch_norm = False
     p.has_bias = True
     return p
+
+
+class FeedForwardNet(quant_utils.QuantizableLayer):
+  """A simple multiple layer feedforward network.
+
+  This class represents a stack of fully connected feedforward network. Each
+  layer in the network can be configured for whether or not to have batch-norm
+  applied to its output, its activation function, whether or not to apply
+  dropout to post-activation output.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(FeedForwardNet, cls).Params()
+    p.Define('input_dim', 0, 'Depth of the input to the network.')
+    p.Define('hidden_layer_dims', [], 'Depth of the hidden layer outputs.')
+    p.Define(
+        'projection', ProjectionLayer.Params(),
+        'Projection layer params. A single parameter that will be shared by'
+        'all layers.')
+    p.Define(
+        'dropout', DropoutLayer.Params(),
+        'Dropout layer params. Can be a single params or a tuple/list of params'
+        ' having the same length as the number of layers.')
+    p.Define(
+        'batch_norm', False,
+        'Whether or not to apply BN to hidden layer output. '
+        'This can be a single bool or a tuple/list of bools having the'
+        ' same length as the number of layers.')
+    p.Define(
+        'activation', 'RELU',
+        'The activation function to use. Can be a single string, or a'
+        ' tuple/list of strings having the same length as the number'
+        ' of layers.')
+    p.Define(
+        'weight_norm', False,
+        'Whether or not to apply weight normalization to weights. This can be '
+        'a single bool or a tuple/list of bools having the same length as the '
+        'number of layers.')
+    p.Define('skip_connections', None, 'Must be None.')
+    p.Define(
+        'bn_fold_weights', None, 'Force folding the batch normalization '
+        'weights in the projection layer.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(FeedForwardNet, self).__init__(params)
+    p = self.params
+    assert p.name
+    assert symbolic.ToStatic(p.input_dim) > 0
+    assert all(symbolic.ToStatic(x) > 0 for x in p.hidden_layer_dims)
+
+    assert p.skip_connections is None
+    batch_norm = p.batch_norm
+    num_layers = len(p.hidden_layer_dims)
+    if isinstance(batch_norm, (list, tuple)):
+      assert len(batch_norm) == num_layers
+    else:
+      batch_norm = [batch_norm] * num_layers
+    weight_norm = p.weight_norm
+    if isinstance(weight_norm, (list, tuple)):
+      assert len(weight_norm) == num_layers
+    else:
+      weight_norm = [weight_norm] * num_layers
+
+    activation = p.activation
+    if isinstance(activation, six.string_types):
+      activation = [activation] * num_layers
+    else:
+      assert len(activation) == num_layers
+    params_dropout_layers = p.dropout
+    if isinstance(params_dropout_layers, (list, tuple)):
+      assert len(params_dropout_layers) == num_layers
+    else:
+      params_dropout_layers = [params_dropout_layers] * num_layers
+
+    with tf.variable_scope(p.name):
+      # Residual connections work better in the form of:
+      #   y = x + Affine(Activation(BatchNorm(x)))
+      params_fc_layers = []
+      in_dim = p.input_dim
+      for i in range(num_layers):
+        out_dim = p.hidden_layer_dims[i]
+        proj_out_dim = out_dim
+        name = '%s_%d' % (p.name, i)
+        params_i = p.projection.Copy().Set(
+            batch_norm=batch_norm[i],
+            weight_norm=weight_norm[i],
+            has_bias=(not batch_norm[i]),
+            activation=activation[i],
+            input_dim=in_dim,
+            output_dim=proj_out_dim,
+            bn_fold_weights=p.bn_fold_weights,
+            name=name)
+        params_fc_layers.append(params_i)
+        in_dim = out_dim
+
+        if p.qdomain.default is not None:
+          params_i.qdomain.default = p.qdomain.default.Copy()
+
+      self.CreateChildren('fc', params_fc_layers)
+      self.CreateChildren('dropout', params_dropout_layers)
+
+  @property
+  def output_dim(self):
+    """Returns output dimension of the FeedForwardNet."""
+    return self.params.hidden_layer_dims[-1]
+
+  def FProp(self, theta, inputs, paddings=None):
+    p = self.params
+    num_layers = len(self.fc)
+
+    in_dim, layer_in = p.input_dim, inputs
+    for i in range(num_layers):
+      layer_in = py_utils.with_dependencies([
+          py_utils.assert_shape_match([tf.shape(layer_in)[-1]],
+                                      [symbolic.ToStatic(in_dim)])
+      ], layer_in)
+      out_dim = p.hidden_layer_dims[i]
+      layer_out = self.fc[i].FProp(theta.fc[i], layer_in, paddings)
+      layer_out = self.dropout[i].FProp(theta.dropout[i], layer_out)
+      layer_in = layer_out
+      in_dim = out_dim
+    return layer_in
+
+  @classmethod
+  def FPropMeta(cls, p, inputs, paddings=None):
+    py_utils.CheckShapes((inputs,))
+    assert inputs[-1] == p.input_dim
+    flops = 0
+    in_dim = inputs[-1]
+    other_dims = inputs.num_elements() / in_dim
+    for out_dim in p.hidden_layer_dims:
+      flops += 5 * other_dims * in_dim * out_dim
+      in_dim = out_dim
+    out_shape = tshape.Shape(inputs[:-1] +
+                             [symbolic.ToStatic(p.hidden_layer_dims[-1])])
+    return py_utils.NestedMap(flops=flops, out_shapes=(out_shape,))
+
+
+class StackingOverTime(base_layer.BaseLayer):
+  """Stacking applied along the time axis.
+
+     At each time step of an input sequence, elements are stacked over the
+     window of ('left_context' + 1 + 'right_context') steps around the current
+     time step. Zeros will be padded to the left or right of the sequence for
+     elements around the boundaries. Finally the stacked outputs are emitted
+     once every 'stride' steps.
+
+     E.g. if an input sequence is: [4], [1], [9], [3], [5], [2], [8]
+     left_context = 1, right_context = 1, stride = 3,
+     then the output sequence would be: [0, 4, 1], [9, 3, 5], [2, 8, 0]
+
+     Note that this layer only performs tensor transformation, so there are no
+     learnable parameters.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(StackingOverTime, cls).Params()
+    p.Define('left_context', 0,
+             'Number of time steps to stack on the left to the central step.')
+    p.Define('right_context', 0,
+             'Number of time steps to stack on the right to the central step.')
+    p.Define('stride', 1, 'The stride for emitting the stacked output.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(StackingOverTime, self).__init__(params)
+    p = self.params
+    assert p.name
+    assert p.left_context >= 0
+    assert p.right_context >= 0
+    assert p.stride >= 1
+
+  @property
+  def window_size(self):
+    """Returns the stacking window size.
+
+    The output dimension will be window_size * the input dimension.
+
+    Returns:
+      Window size.
+    """
+    p = self.params
+    return p.left_context + p.right_context + 1
+
+  def _ApplyStack(self, inputs, pad_value=0.0):
+    """The core function to apply the stacking to inputs.
+
+    Args:
+      inputs: [batch, time, depth].
+      pad_value: the padding value for left/right context.
+
+    Returns:
+      [batch, ceil(time / stride), depth * stacking_window_length] tensor.
+    """
+    p = self.params
+    if p.left_context == 0 and p.right_context == 0:
+      out = inputs
+    else:
+      inputs_max_len = py_utils.GetShape(inputs, 3)[1]
+      # Add zero paddings to the left and right of the input sequence.
+      inputs = tf.pad(
+          inputs, [[0, 0], [p.left_context, p.right_context], [0, 0]],
+          constant_values=pad_value)
+
+      # Make window_size() copies of the padded sequence with the original
+      # sequence length, where each copy is offset by 1 time step.
+      pieces = []
+      for i in range(self.window_size):
+        pieces.append(inputs[:, i:i + inputs_max_len])
+      # Apply stacking.
+      out = tf.concat(pieces, 2)
+
+    # Apply striding.
+    out = out[:, ::p.stride]
+    return out
+
+  def FProp(self, inputs, paddings=None):
+    """Apply the stacking to inputs along the time axis.
+
+    Args:
+      inputs: The inputs tensor. It is expected to be of shape [batch, time,
+        feature].
+      paddings: The paddings tensor. It is expected to be of shape [batch, time,
+        1], where all but the last dimension match inputs. Each value is 0 or 1
+        indicating whether a time step of a sequence is padded in the inputs to
+        reach the max length in the batch.
+
+    Returns:
+      (outputs, out_paddings) pair.
+        outputs is of shape [batch, ceil(time / stride), feature * stacking].
+        out_paddings is of shape [batch, ceil(time / stride), 1]. out_paddings
+        will be 0 if any of the corresponding input padding is 0.
+    """
+    if paddings is None:
+      paddings = tf.zeros(
+          tf.concat([py_utils.GetShape(inputs)[:-1], [1]], 0),
+          dtype=inputs.dtype)
+    inputs = py_utils.with_dependencies(
+        [
+            # Checks the inputs shape has 3 dimensions.
+            py_utils.assert_shape_match(tf.shape(inputs), [-1, -1, -1]),
+            # Checks the paddings shape has 3 dimensions, and the last one is 1.
+            py_utils.assert_shape_match(tf.shape(paddings), [-1, -1, 1]),
+            # Checks the first two dimensions of inputs and paddings match.
+            py_utils.assert_shape_match(
+                tf.shape(inputs)[:-1],
+                tf.shape(paddings)[:-1])
+        ],
+        inputs)
+    p = self.params
+    with tf.name_scope(p.name):
+      outputs = self._ApplyStack(inputs)
+
+      # Stack the padding values with the same context and stride parameters.
+      # Then take the minimum padding values within each stacking window, since
+      # an output time step becomes a padded one only if all of the underlying
+      # stacked steps are padded ones.
+      out_paddings = self._ApplyStack(paddings, pad_value=1)
+      out_paddings = tf.reduce_min(out_paddings, axis=2, keepdims=True)
+
+      return outputs, out_paddings
+
+  def Unstack(self, stacked):
+    """Inverts stacking over time.
+
+    Given 'stacked' outputs from this StackingOverTime layer,
+
+      stacked, _ = this_layer.FProp(inputs),
+
+    this method attempts to reconstruct the original 'inputs'.
+
+    If stride > window_size, the original input cannot be recovered, and a
+    ValueError is raised.
+
+    Otherwise, if right_context + 1 >= stride, this method returns a Tensor that
+    is identical to 'inputs' but potentially longer due to paddings.
+
+    If right_context + 1 < stride, this method returns a Tensor that may be up
+    to ```stride - right_context - 1``` frames shorter than the original input,
+    but identical in the frames that are returned. e.g.::
+
+      left_context = 2, right_context = 1, stride = 4
+      input sequence:     1 2 3 4 5 6 7 8
+      after padding:  0 0 1 2 3 4 5 6 7 8 0
+      windows:
+        [0 0 (1) 2] 3 4 5 6 7 8 0
+         0 0 1 2 [3 4 (5) 6] 7 8 0
+      stacked:
+        [[0 0 1 2], [3 4 5 6]]
+      unstacked:
+        [1 2 3 4 5 6], which is 4 - 1 - 1 = 2 (stride - right_context - 1)
+        frames shorter than the original input.
+
+    `Unstack()` can be used to project the outputs of downstream layers back to
+    the shape of the original unstacked inputs. For example::
+
+        inputs = ...  # [batch, length, input_dim]
+        # [batch, ceil(length / stride), rnn_dim]
+        rnn_out = rnn.FProp(stacking.FProp(inputs)[0])
+        # [batch, length, rnn_dim]
+        back_projected_rnn_out = py_utils.PadOrTrimTo(
+            stacking.Unstack(tf.tile(rnn_out, [1, 1, stacking.window_size])),
+            py_utils.GetShape(inputs))
+
+    Note this method does not take or return a separate padding tensor. The
+    caller is responsible for knowing which of outputs are padding (e.g. based
+    on the padding of the original FProp inputs).
+
+    Args:
+      stacked: Tensor of shape [batch, time, window_size * feature_dim], assumed
+        to be the output of `FProp`.
+
+    Returns:
+      The reconstructed input Tensor, with shape
+      [batch, (frames - 1) * stride + right_context + 1, feature_dim].
+
+    Raises:
+      ValueError: if stride > window_size.
+    """
+    p = self.params
+    if p.stride > self.window_size:
+      raise ValueError(
+          "Can't invert StackingOverTime with stride (%d) > window_size (%d)" %
+          (p.stride, self.window_size))
+
+    # Reshape to allow indexing individual frames within each stacked window.
+    batch_size, stacked_length, _ = py_utils.GetShape(stacked, 3)
+    stacked = tf.reshape(stacked,
+                         [batch_size, stacked_length, self.window_size, -1])
+
+    # Compute the index of the window and frame in 'stacked' where each frame of
+    # the original input is located, and extract them with tf.gather_nd.
+    # First compute for all except the last window, since these elements have
+    # the potential of being looked up from the next window.
+    input_indices = tf.range(0, (stacked_length - 1) * p.stride)
+    mod = input_indices % p.stride
+    in_next_window = tf.cast(tf.greater(mod, p.right_context), tf.int32)
+    window_index = input_indices // p.stride + in_next_window
+    frame_index = p.left_context + mod - p.stride * in_next_window
+    # Now handle the last window explicitly and concatenate onto the existing
+    # window_index/frame_index tensors.
+    last_window_length = p.right_context + 1
+    window_index = tf.concat(
+        [window_index,
+         tf.fill([last_window_length], stacked_length - 1)],
+        axis=0)
+    frame_index = tf.concat(
+        [frame_index, p.left_context + tf.range(last_window_length)], axis=0)
+    # Stack the indices for tf.gather_nd.
+    window_and_frame_indices = tf.stack([window_index, frame_index], axis=1)
+    window_and_frame_indices = tf.tile(
+        tf.expand_dims(window_and_frame_indices, 0), [batch_size, 1, 1])
+    return tf.gather_nd(stacked, window_and_frame_indices, batch_dims=1)
 
 
 class PoolingLayer(quant_utils.QuantizableLayer):
@@ -1352,6 +1628,174 @@ class PoolingLayer(quant_utils.QuantizableLayer):
       return out, out_padding
 
 
+class BlurPoolLayer(base_layer.BaseLayer):
+  """BlurPool from https://arxiv.org/pdf/1904.11486.pdf.
+
+  This layer blurs the input with a fixed filter and performs subsampling
+  afterwards. Only supports 2x1 or 2x2 spatial reduction.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(BlurPoolLayer, cls).Params()
+    p.Define('blur_filter', 'B5', 'One of [R2, T3, B5]; the fixed blur filter.')
+    p.Define('subsample_type', '1D', 'Choose between [1D, 2D] subsampling.')
+    p.Define('input_channels', None, 'Number of input channels.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(BlurPoolLayer, self).__init__(params)
+    p = self.params
+    assert p.name
+    assert p.blur_filter in ['R2', 'T3', 'B5']
+    assert p.subsample_type in ['1D', '2D']
+    assert p.input_channels
+
+    filter_dict = {
+        'B5': np.array([1, 4, 6, 4, 1], dtype=np.float32),
+        'T3': np.array([1, 2, 1], dtype=np.float32),
+        'R2': np.array([1, 1], dtype=np.float32)
+    }
+    base_filter = filter_dict[p.blur_filter]
+
+    if p.subsample_type == '2D':
+      base_filter = base_filter[:, np.newaxis] * base_filter[np.newaxis, :]
+    else:
+      base_filter = base_filter[:, np.newaxis]
+    base_filter /= base_filter.sum()
+
+    self._blur_filter = np.tile(base_filter[..., np.newaxis, np.newaxis],
+                                (1, 1, p.input_channels, 1))
+    conv_params = DepthwiseConv2DLayer.Params().Set(
+        activation='NONE',
+        batch_norm=False,
+        filter_stride=(1, 1),
+        filter_shape=self._blur_filter.shape)
+
+    self.CreateChild('blur_conv', conv_params)
+
+  def FProp(self, theta, inputs, paddings=None):
+    """Apply blur pooling.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      inputs: The inputs tensor. It is expected to be of shape [batch, time,
+        frequency, channel]. The time dimension corresponds to the height
+        dimension as in images and the frequency dimension corresponds to the
+        width dimension as in images.
+      paddings: The paddings tensor. It is expected to be of shape [batch,
+        time]. Defaults to None, which means there no paddings.
+
+    Returns:
+      outputs, out_paddings pair.
+    """
+    p = self.params
+    if paddings is not None:
+      inputs = py_utils.with_dependencies([
+          py_utils.assert_shape_match(tf.shape(paddings), [-1, -1]),
+          py_utils.assert_shape_match(tf.shape(inputs)[:2], tf.shape(paddings))
+      ], inputs)
+    # blur
+    theta_cp = copy.copy(theta.blur_conv)
+    theta_cp.w = tf.convert_to_tensor(self._blur_filter, dtype=p.dtype)
+    out, out_padding = self.blur_conv.FProp(theta_cp, inputs, paddings)
+
+    # b/142399320
+    # Use stride in blur conv for subsampling once non-square stride gets
+    # supported.
+    if p.subsample_type == '2D':
+      out = out[:, ::2, ::2, :]
+    else:
+      out = out[:, ::2, :, :]
+
+    if out_padding is not None:
+      out_padding = _ComputeConvOutputPadding(
+          out_padding, window=2, stride=2, padding_algorithm='SAME')
+      out *= (1.0 - out_padding)[..., tf.newaxis, tf.newaxis]
+    else:
+      out_padding = None
+
+    return out, out_padding
+
+
+class SingleShardEmbeddingLayer(base_layer.BaseLayer):
+  """Embedding layer that is not sharded.
+
+  This embedding layer is expected to be replicated over all compute devices
+  (e.g. tpu cores). It is intended to support small to medium embedding tables
+  (< 50k) only.
+
+  This is intended to be a unification of EmbeddingLayer and
+  SimpleEmbeddingLayer (and cleanup of both). It is targeting the most common
+  use-case we have in speech/nmt/tts/deeprank. Currently we often first
+  configure a model using EmbeddingLayer, and then call ChangeToSimpleEmbedding
+  to switch to SimpleEmbedding where  we lose some configuration (e.g.
+  scale_by_sqrt_dim).
+
+  TODO(lingvo): Implement the matmul option which should be more efficient for
+  small vocabs (e.g. < 1k vocab).
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(SingleShardEmbeddingLayer, cls).Params()
+    p.Define('vocab_size', 0, 'Num tokens in vocab.')
+    p.Define('embedding_dim', 0, 'Depth of the output.')
+    p.Define(
+        'scale_sqrt_depth', False, 'If set True, activations are scaled'
+        ' with sqrt(embedding_dim) in EmbLookup.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(SingleShardEmbeddingLayer, self).__init__(params)
+    p = self.params
+    assert p.vocab_size > 0
+    assert p.embedding_dim > 0
+    assert p.name
+
+    with tf.variable_scope(p.name):
+      w_pc = py_utils.WeightParams(
+          shape=[p.vocab_size, p.embedding_dim],
+          init=p.params_init,
+          dtype=p.dtype,
+          collections=[self.__class__.__name__ + '_vars'])
+      self.CreateVariable('emb_var', w_pc)
+
+  def EmbLookupDefaultTheta(self, ids):
+    return self.EmbLookup(self.theta, ids)
+
+  def EmbLookup(self, theta, ids):
+    """Looks up embedding vectors for ids.
+
+    Args:
+      theta: Named tuple with the weight matrix for the embedding.
+      ids: A rank-N int32 tensor.
+
+    Returns:
+      A rank-(N+1) params.dtype tensor.
+      embs[indices, :] is the embedding vector for ids[indices].
+    """
+    p = self.params
+    ids = tf.convert_to_tensor(ids)
+    ids = py_utils.with_dependencies([
+        py_utils.assert_between(
+            ids, 0, p.vocab_size, name='vocab_id_validation')
+    ], ids)
+    embs = tf.nn.embedding_lookup(theta.emb_var, tf.reshape(ids, [-1]))
+    if p.scale_sqrt_depth:
+      embs *= p.embedding_dim**0.5
+    if p.vn.global_vn or p.vn.per_step_vn:
+      embs = py_utils.AddGlobalVN(p, embs)
+    out_shape = tf.concat([tf.shape(ids), [p.embedding_dim]], 0)
+    return tf.reshape(embs, out_shape)
+
+  def FProp(self, theta, ids):
+    return self.EmbLookup(theta, ids)
+
+
 class EmbeddingLayer(base_layer.BaseLayer):
   """Embedding layer."""
 
@@ -1436,8 +1880,10 @@ class EmbeddingLayer(base_layer.BaseLayer):
     """
     p = self.params
     ids = tf.convert_to_tensor(ids)
-    ids = py_utils.with_dependencies(
-        [py_utils.assert_between(ids, 0, p.vocab_size)], ids)
+    ids = py_utils.with_dependencies([
+        py_utils.assert_between(
+            ids, 0, p.vocab_size, name='vocab_id_validation')
+    ], ids)
     embs = tf.nn.embedding_lookup(theta.wm, tf.reshape(ids, [-1]))
     if p.scale_sqrt_depth:
       embs *= p.embedding_dim**0.5
@@ -1445,6 +1891,347 @@ class EmbeddingLayer(base_layer.BaseLayer):
       embs = py_utils.AddGlobalVN(p, embs)
     out_shape = tf.concat([tf.shape(ids), [p.embedding_dim]], 0)
     return tf.reshape(embs, out_shape)
+
+
+class TPUEmbeddingTable(base_layer.BaseLayer):
+  """An embedding table controlled by TPUEmbeddingLayer.
+
+  Note that all input_keys needs to be declared upfront.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(TPUEmbeddingTable, cls).Params()
+    p.Define('vocab_size', 0, 'Depth of the input.')
+    p.Define('embedding_dim', 0, 'Depth of the output.')
+    p.Define('input_keys', None, 'Name of inputs in InputBatch.')
+    p.Define(
+        'combiner', 'mean',
+        'Must be "sum", "sqrtn", "mean" or None in the case of a '
+        '"sequence embedding "')
+    p.Define(
+        'max_sequence_length', None,
+        'If not None or 0, embedding lookup will return a '
+        '"sequence embedding" of shape '
+        '`[batch, max_sequence_length, embedding_dim]` without applying a '
+        'sequence  reducing combiner')
+    p.Define('initial_accumulator', None, 'Initial value of accumulator.')
+    p.Define('num_tpu_hosts', 0, 'Total number of TPU hosts.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(TPUEmbeddingTable, self).__init__(params)
+    p = self.params
+    assert p.vocab_size > 0
+    assert p.embedding_dim > 0
+    assert p.input_keys
+    assert p.initial_accumulator > 0
+    assert p.name
+    assert p.num_tpu_hosts > 0
+    if p.combiner is None:
+      assert p.max_sequence_length
+    if p.max_sequence_length is not None and p.max_sequence_length > 0:
+      assert p.combiner is None
+
+    cluster = self.cluster
+    num_hosts = p.num_tpu_hosts
+
+    self._ids_per_shard = int(math.ceil(float(p.vocab_size) / num_hosts))
+    self._padded_vocab_size = self._ids_per_shard * num_hosts
+    self._input_keys = p.input_keys
+
+    self._max_sequence_length = 0
+    if p.max_sequence_length:
+      self._max_sequence_length = p.max_sequence_length
+
+    self._table_name = '{}_table'.format(p.name)
+    self._table_config = tpu_embedding_lib.TableConfig(
+        self._padded_vocab_size, p.embedding_dim, combiner=p.combiner)
+
+    w_pc = py_utils.WeightParams(
+        shape=[self._ids_per_shard, p.embedding_dim],
+        init=p.params_init,
+        dtype=p.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+    w_ada = py_utils.WeightParams(
+        shape=[self._ids_per_shard, p.embedding_dim],
+        init=py_utils.WeightInit.Constant(p.initial_accumulator),
+        dtype=p.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+
+    self._embedding_table_var = []
+    self._load_op_list = []
+    self._retrieve_op_list = []
+
+    with tf.variable_scope(p.name):
+      for i in range(num_hosts):
+        if self.do_eval:
+          device_name = None
+        else:
+          device_name = '{}/replica:0/task:{}/device:CPU:0'.format(
+              cluster.params.worker.name, i)
+
+        with tf.device(device_name), py_utils.outside_all_rewrites():
+          _, vi_var = py_utils.CreateVariable('var_%d' % i, w_pc)
+          self._embedding_table_var.append(vi_var)
+
+          # Only trainer and controller needs the slot variables.
+          if self.do_eval:
+            continue
+          _, accumulator_var = py_utils.CreateVariable(
+              'var_%d/Adagrad' % i, w_ada, trainable=False)
+
+          # Only the Trainer needs these ops.
+          if py_utils.use_tpu():
+            tf.logging.info('creating load and retrieve ops.')
+            load_parameters_op = (
+                tpu_embedding_lib.tpu_ops.load_tpu_embedding_adagrad_parameters(
+                    parameters=vi_var,
+                    accumulators=accumulator_var,
+                    table_name=self._table_name,
+                    num_shards=num_hosts,
+                    shard_id=i))
+            self._load_op_list.append(load_parameters_op)
+
+            retrieved_table, retrieved_accumulator = (
+                tpu_embedding_lib.tpu_ops
+                .retrieve_tpu_embedding_adagrad_parameters(
+                    table_name=self._table_name,
+                    num_shards=num_hosts,
+                    shard_id=i))
+            retrieve_parameters_op = tpu_embedding_lib.control_flow_ops.group(
+                tf.assign(vi_var, retrieved_table),
+                tf.assign(accumulator_var, retrieved_accumulator))
+            self._retrieve_op_list.append(retrieve_parameters_op)
+
+    self._private_vars['wm'] = self._embedding_table_var
+    self._private_theta['wm'] = [
+        tf.identity(v) for v in self._embedding_table_var
+    ]
+
+  @property
+  def table_config(self):
+    return self._table_config
+
+  @property
+  def table_name(self):
+    return self._table_name
+
+  @property
+  def retrieve_op_list(self):
+    return self._retrieve_op_list
+
+  @property
+  def load_op_list(self):
+    return self._load_op_list
+
+  @property
+  def input_keys(self):
+    return self._input_keys
+
+  @property
+  def max_sequence_length(self):
+    return self._max_sequence_length
+
+  def CpuEmbLookup(self, ids_map):
+    """CPU evaluation embedding lookup.
+
+    Args:
+      ids_map: A dict of `input_key` string -> [batch, sequence] int32 Tensor.
+        -1 is used as a padding id.
+
+    Returns:
+      An activations dict of string -> float32 Tensor.
+      For non-sequence embeddings: [batch, 1, embedding_dim]
+      For sequence embeddings: [batch, max_sequence_length, embedding_dim]
+
+    """
+    p = self.params
+    rets = py_utils.NestedMap()
+    if self.max_sequence_length > 0:
+      # "Sequence embedding", no combiner case
+      for k, ids in ids_map.items():
+        embs = tf.nn.embedding_lookup(self.theta.wm, tf.reshape(ids, [-1]))
+        out_shape = tf.concat([tf.shape(ids), [p.embedding_dim]], 0)
+        rets[k] = tf.reshape(embs, out_shape)
+    else:
+      # Non-"Sequence embedding", combiner case
+      for k, ids in ids_map.items():
+        # Dense to sparse.
+        dense_shape = tf.shape(ids, out_type=tf.int64)
+        sample_indices = tf.cast(tf.where(tf.not_equal(ids, -1)), tf.int64)
+        embedding_indices = tf.cast(tf.gather_nd(ids, sample_indices), tf.int64)
+        sparse_ids = tf.SparseTensor(
+            indices=sample_indices,
+            values=embedding_indices,
+            dense_shape=dense_shape)
+        # [?, embedding_dim]
+        # For tf.nn.embedding_lookup_sparse, output.dim0 might be different from
+        # sparse_ids.dense_shape.dim0.
+        # In fact, the '?' is the smallest span starting from the index=0 that
+        # covers all the results.
+        embs = tf.nn.embedding_lookup_sparse(
+            self.theta.wm,
+            sparse_ids,
+            None,  # sp_weights
+            combiner=p.combiner)
+        batch_size = dense_shape[0]
+        # Explicitly pad results to maintain dim0=batch.
+        dim0_padlen = tf.cast(batch_size, tf.int32) - tf.shape(embs)[0]
+        embs = tf.pad(embs, [[0, dim0_padlen], [0, 0]])
+        # [batch, 1, embedding_dim]
+        embs = py_utils.HasShape(embs, [batch_size], ndims=1)
+        rets[k] = tf.expand_dims(embs, 1)
+    return rets
+
+
+class TPUEmbeddingLayer(base_layer.BaseLayer):
+  """Monolithic interface to TPU embedding.
+
+  This layer has some important caveats, due to the interface of the
+  TPU embedding hardware. Its behavior most closely mimics that of
+  tf.nn.embedding_lookup_sparse.
+
+  Supports multiple tables and multiple input_keys per table.
+  Only supports Adagrad.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(TPUEmbeddingLayer, cls).Params()
+    p.Define('tables', None, 'TPUEmbeddingTables')
+    p.Define('pipeline_execution_with_tensor_core', False,
+             'Set to True to be faster. See tpu_embedding.py for details.')
+    p.Define('batch_size', 0, 'Per-core batch size.')
+    p.Define('learning_rate', None, 'Learning rate.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(TPUEmbeddingLayer, self).__init__(params)
+    p = self.params
+
+    assert p.tables
+    assert p.batch_size > 0
+    assert p.learning_rate > 0
+    assert p.name
+
+    initial_accumulator = p.tables[0].initial_accumulator
+    assert initial_accumulator > 0
+    assert np.all(
+        [t.initial_accumulator == initial_accumulator for t in p.tables])
+    num_tpu_hosts = p.tables[0].num_tpu_hosts
+    assert np.all([t.num_tpu_hosts == num_tpu_hosts for t in p.tables])
+
+    cluster = self.cluster
+
+    self.CreateChildren('tables', p.tables)
+    load_op_list = []
+    retrieve_op_list = []
+
+    # At the feature level, track which are associated
+    # with "sequence embeddings".
+    self._sequence_features = {}
+
+    if py_utils.use_tpu():
+      num_cores = cluster.params.worker.tpus_per_replica
+      global_batch_size = (
+          self.params.batch_size * self.cluster.num_splits_per_client)
+      table_to_config_dict = {}
+      feature_to_config_dict = {}
+      for table in self.tables:
+        table_to_config_dict[table.table_name] = table.table_config
+        load_op_list += table.load_op_list
+        retrieve_op_list += table.retrieve_op_list
+        for feature in table.input_keys:
+          if table.max_sequence_length > 0:
+            self._sequence_features[feature] = True
+          feature_to_config_dict[feature] = tpu_embedding_lib.FeatureConfig(
+              table.table_name, max_sequence_length=table.max_sequence_length)
+      mode = tpu_embedding_lib.TRAINING
+      optimization_parameters = tpu_embedding_lib.AdagradParameters(
+          p.learning_rate, initial_accumulator)
+      device_config = tpu_embedding_lib.DeviceConfig(
+          num_cores=num_cores,
+          num_hosts=num_tpu_hosts,
+          job_name=cluster.params.worker.name)
+      self._tpu_embedding = tpu_embedding_lib.TPUEmbedding(
+          table_to_config_dict,
+          feature_to_config_dict,
+          global_batch_size,
+          mode,
+          master=None,
+          optimization_parameters=optimization_parameters,
+          pipeline_execution_with_tensor_core=p
+          .pipeline_execution_with_tensor_core,
+          device_config=device_config)
+      tf.add_to_collection(py_utils.TPU_EMBEDDING, self._tpu_embedding)
+
+    if py_utils.use_tpu():
+      tf.logging.info('adding load and retrieve ops to collection.')
+      tf.add_to_collection(py_utils.TPU_EMBEDDING_LOAD_OPS, load_op_list)
+      tf.add_to_collection(py_utils.TPU_EMBEDDING_RETRIEVE_OPS,
+                           retrieve_op_list)
+
+  def EmbLookup(self, ids_map):
+    """Looks up embedding vectors for each entry in ids_map.
+
+    Since the TPUEmbedding is monolothic, and consulted once per
+    FProp/BPRop, we must centralize the lookup. Thus, for multiple
+    features, we contain them into a single-lookup rather than allowing
+    the caller to call Lookup multiple times.
+
+    Currently, there's also an implied combination step which combines
+    the sequence into a single set of activations by sum, mean or
+    sqrtn.
+
+    Args:
+      ids_map: A dict of `input_key` string -> [batch, sequence] int32 Tensor.
+        -1 is used as a padding id.
+
+    Returns:
+      Activations dict of string ->
+      For non-sequence embeddings:  [batch, 1, embedding_dim],
+      For sequence embeddings: [batch, max_sequence_length, embedding_dim]
+      float32 Tensor.
+    """
+
+    def TpuEmbLookup(ids_map):
+      """TPU Embedding lookup."""
+      del ids_map
+      activations = self._tpu_embedding.get_activations()
+      tf.add_to_collection(py_utils.TPU_EMBEDDING_ACTIVATIONS, activations)
+      ret = py_utils.NestedMap()
+      for k, v in activations.items():
+        if k in self._sequence_features:
+          ret[k] = v
+        else:
+          # Non-sequence embeddings, we fill the "time" dimension with 1.
+          ret[k] = tf.expand_dims(v, axis=[1])
+      return ret
+
+    def CpuEmbLookup(ids_map):
+      """CPU evaluation embedding lookup."""
+      rets = py_utils.NestedMap()
+      for table in self.tables:
+        table_id_map = {}
+        for key in table.input_keys:
+          table_id_map[key] = ids_map[key]
+        table_rets = table.CpuEmbLookup(table_id_map)
+        # Merge table_rets with rets
+        for k, v in table_rets.items():
+          rets[k] = v
+      return rets
+
+    if self.do_eval:
+      return CpuEmbLookup(ids_map)
+    elif not py_utils.use_tpu():
+      # Contoller
+      return CpuEmbLookup(ids_map)
+    else:
+      # TPU Trainer
+      return TpuEmbLookup(ids_map)
 
 
 class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
@@ -1482,6 +2269,9 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
         '[num_rows, embed_dim // 128, 128].')
     p.Define('apply_pruning', False,
              'Whether to prune the weights while training')
+    p.Define(
+        'scale_sqrt_depth', False, 'If set True, activations are scaled'
+        ' with sqrt(embedding_dim) in EmbLookup.')
     return p
 
   @base_layer.initializer
@@ -1489,7 +2279,7 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
     super(SimpleEmbeddingLayer, self).__init__(params)
     p = self.params
     assert p.vocab_size > 0
-    assert p.embedding_dim > 0
+    assert symbolic.ToStatic(p.embedding_dim) > 0
 
     valid_fprop_modes = ['loop', 'matmul', 'gather']
     self._fprop_mode = p.fprop_mode
@@ -1500,12 +2290,12 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
 
     if py_utils.tpu_compat() and self._fprop_mode != 'matmul':
       if p.use_3d_weight_tensor:
-        assert p.embedding_dim % 128 == 0
-        emb_shape_suf = [p.embedding_dim // 128, 128]
+        assert symbolic.ToStatic(p.embedding_dim) % 128 == 0
+        emb_shape_suf = [symbolic.ToStatic(p.embedding_dim) // 128, 128]
       else:
-        emb_shape_suf = [p.embedding_dim]
+        emb_shape_suf = [symbolic.ToStatic(p.embedding_dim)]
     else:
-      emb_shape_suf = [p.embedding_dim]
+      emb_shape_suf = [symbolic.ToStatic(p.embedding_dim)]
     weight_shape = [p.vocab_size] + emb_shape_suf
 
     with tf.variable_scope(p.name):
@@ -1538,10 +2328,10 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
       else:
         self.CreateVariable('wm', pc)
 
-    # flags passed to @function.Defun
+    # flags passed to @tf.Defun
     compiled = py_utils.use_xla()
 
-    @function.Defun(p.dtype, tf.int32, p.dtype)
+    @tf.Defun(py_utils.FPropDtype(p), tf.int32, py_utils.FPropDtype(p))
     def EmbBprop(embs, ids_vec, drets):
       """Embedding backprop.
 
@@ -1558,17 +2348,20 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
         drets: A matrix of size (size of ids_vec, embedding dims).
 
       Returns:
-        dembs: A matrix of the same shape of embs. Gradients for embs.
-        dids_vec: Zeros. Same shape as ids_vec.
+        Tuple(tensor, tensor):
+
+          - dembs: A matrix of the same shape of embs. Gradients for embs.
+          - dids_vec: Zeros. Same shape as ids_vec.
       """
       del embs
       num = tf.shape(ids_vec)[0]
-      dembs = inplace_ops.empty(weight_shape, p.dtype, init=True)
+      dembs = inplace_ops.empty(weight_shape, py_utils.FPropDtype(p), init=True)
       if len(weight_shape) != 2:
         drets_shape = tf.shape(drets)
         drets = tf.reshape(drets, [drets_shape[0]] + emb_shape_suf)
 
-      @function.Defun(tf.int32, tf.int32, p.dtype, p.dtype)
+      @tf.Defun(tf.int32, tf.int32, py_utils.FPropDtype(p),
+                py_utils.FPropDtype(p))
       def EmbBpropLoop(i, ids_vec, drets, dembs):
         # row_id = ids_vec[i]
         row_id = tf.gather(ids_vec, i)
@@ -1585,9 +2378,18 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
           inputs=[ids_vec, drets, dembs],
           body=EmbBpropLoop,
           rewrite_with_while=compiled)
+
+      if p.scale_sqrt_depth:
+        dembs *= p.embedding_dim**0.5
+
       return dembs, tf.zeros_like(ids_vec)
 
-    @function.Defun(p.dtype, tf.int32, grad_func=EmbBprop)
+    @tf.Defun(
+        py_utils.FPropDtype(p),
+        tf.int32,
+        grad_func=EmbBprop,
+        _implements=self.layer_type + '.EmbFProp',
+        _reference=constants.REFERENCE_ANNOTATION)
     def EmbFprop(embs, ids_vec):
       """Embedding forward prop.
 
@@ -1603,13 +2405,14 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
         ids_vec: A vector of int32 embedding ids.
 
       Returns:
-        rets: The result of embedding lookups. A matrix of shape
-          (num ids in ids_vec, embedding dims).
+        The result of embedding lookups. A matrix of shape
+        [num ids in ids_vec, embedding dims].
       """
       num = tf.shape(ids_vec)[0]
-      rets = inplace_ops.empty([num] + emb_shape_suf, p.dtype)
+      rets = inplace_ops.empty([num] + emb_shape_suf, py_utils.FPropDtype(p))
 
-      @function.Defun(tf.int32, p.dtype, tf.int32, p.dtype)
+      @tf.Defun(tf.int32, py_utils.FPropDtype(p), tf.int32,
+                py_utils.FPropDtype(p))
       def EmbFpropLoop(i, embs, ids_vec, rets):
         # row_id = ids_vec[i]
         row_id = tf.gather(ids_vec, i)
@@ -1627,17 +2430,24 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
           body=EmbFpropLoop,
           rewrite_with_while=compiled)
       if len(weight_shape) > 2:
-        rets = tf.reshape(rets, [num, p.embedding_dim])
+        rets = tf.reshape(rets, [num, symbolic.ToStatic(p.embedding_dim)])
       return rets
 
+    @tf.Defun(
+        py_utils.FPropDtype(p),
+        tf.int32,
+        _implements=self.layer_type + '.EmbMatmul',
+        _reference=constants.REFERENCE_ANNOTATION)
     def EmbMatmul(embs, ids_vec):
+      """Lookups embedding vectors by doing Matmul with one-hot vector."""
       # lhs[i, j] is True iff ids_vec[i] == j.
       lhs = tf.equal(
-          tf.expand_dims(ids_vec, 1), tf.range(
-              p.vocab_size, dtype=ids_vec.dtype))
+          tf.expand_dims(ids_vec, 1),
+          tf.range(p.vocab_size, dtype=ids_vec.dtype))
       return tf.matmul(tf.cast(lhs, embs.dtype), embs)
 
     def EmbGather(embs, ids_vec):
+      """Lookups embedding vectors."""
       return tf.nn.embedding_lookup(embs, ids_vec)
 
     if self._fprop_mode == 'matmul':
@@ -1658,7 +2468,10 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
     """A faster path for CPU inference than the default gather."""
     p = self.params
     embs = tf.nn.embedding_lookup(self.theta.wm, tf.reshape(ids, [-1]))
-    out_shape = tf.concat([tf.shape(ids), [p.embedding_dim]], 0)
+    out_shape = tf.concat([tf.shape(ids), [symbolic.ToStatic(p.embedding_dim)]],
+                          0)
+    if p.scale_sqrt_depth:
+      embs *= p.embedding_dim**0.5
     return tf.reshape(embs, out_shape)
 
   def FProp(self, theta, ids):
@@ -1672,17 +2485,88 @@ class SimpleEmbeddingLayer(quant_utils.QuantizableLayer):
       A rank-(N+1) params.dtype tensor.
       embs[indices, :] is the embedding vector for ids[indices].
     """
+    if not isinstance(ids, tf.Tensor):
+      tf.logging.warning('ids should be a tf.Tensor!')
+      ids = tf.convert_to_tensor(ids, tf.int32)
+    elif ids.dtype != tf.int32:
+      tf.logging.warning('ids should be tf.int32, but is %s!', ids.dtype)
+      ids = tf.cast(ids, tf.int32)
     p = self.params
     if not py_utils.use_xla():
-      ids = py_utils.with_dependencies(
-          [py_utils.assert_between(ids, 0, p.vocab_size)], ids)
+      ids = py_utils.with_dependencies([
+          py_utils.assert_between(
+              ids, 0, p.vocab_size, name='vocab_id_validation')
+      ], ids)
     embs_result = self._fprop(self.QWeight(theta.wm), tf.reshape(ids, [-1]))
     if p.vn.global_vn or p.vn.per_step_vn:
-      emb_noise = p.vn.scale * tf.random_normal(
-          tf.shape(embs_result), stddev=1.0, dtype=embs_result.dtype)
+      emb_noise = p.vn.scale * tf.random.normal(
+          tf.shape(embs_result),
+          stddev=1.0,
+          dtype=embs_result.dtype,
+          seed=p.random_seed)
       embs_result += emb_noise
-    out_shape = tf.concat([tf.shape(ids), [p.embedding_dim]], 0)
+
+    if p.scale_sqrt_depth:
+      embs_result *= p.embedding_dim**0.5
+
+    out_shape = tf.concat([tf.shape(ids), [symbolic.ToStatic(p.embedding_dim)]],
+                          0)
     return tf.reshape(embs_result, out_shape)
+
+
+class OneHotEmbeddingLayer(base_layer.BaseLayer):
+  """Generates one-hot embeddings with uncertainties."""
+
+  @classmethod
+  def Params(cls):
+    p = super(OneHotEmbeddingLayer, cls).Params()
+    p.Define('vocab_size', 0,
+             'Depth of the input. I.e., the number of classes.')
+    p.Define('embedding_dim', 0, 'Depth of the output.')
+    p.Define('uncertainty', 0.0, 'Uncertainty of the correct ID.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(OneHotEmbeddingLayer, self).__init__(params)
+    p = self.params
+    assert p.name
+    assert p.vocab_size > 1
+    assert p.embedding_dim == p.vocab_size
+
+  def EmbLookupDefaultTheta(self, ids):
+    """Lookups embedding vectors for ids."""
+    return self.FProp(self.theta, ids)
+
+  def EmbLookup(self, theta, ids):
+    return self.FProp(theta, ids)
+
+  def FProp(self, theta, ids):
+    """Lookups embedding vectors for ids.
+
+    Args:
+      theta: Named tuple collection of weights for the layer.
+      ids: A rank-N int32 tensor.
+
+    Returns:
+      A rank-(N+1) params.dtype tensor.
+      embs[indices, :] is the embedding vector for ids[indices].
+    """
+    del theta
+    p = self.params
+    if not py_utils.use_xla():
+      ids = py_utils.with_dependencies([
+          py_utils.assert_between(
+              ids, 0, p.vocab_size, name='vocab_id_validation')
+      ], ids)
+    low_confidence = p.uncertainty / tf.cast(p.vocab_size - 1, tf.float32)
+    high_confidence = 1.0 - p.uncertainty
+    embs_result = tf.one_hot(
+        ids,
+        depth=p.vocab_size,
+        on_value=high_confidence,
+        off_value=low_confidence)
+    return embs_result
 
 
 class PositionalEmbeddingLayer(base_layer.BaseLayer):
@@ -1748,8 +2632,9 @@ class PositionalEmbeddingLayer(base_layer.BaseLayer):
     seq_length = tf.shape(position)[1]
     num_timescales = p.embedding_dim // 2
     log_timescale_increment = (
-        math.log(float(p.max_timescale) / float(p.min_timescale)) /
-        (tf.cast(num_timescales, py_utils.FPropDtype(p)) - 1))
+        math.log(float(p.max_timescale) / float(p.min_timescale)) / tf.maximum(
+            tf.cast(1.0, py_utils.FPropDtype(p)),
+            tf.cast(num_timescales, py_utils.FPropDtype(p)) - 1))
 
     inv_timescales = p.min_timescale * tf.exp(
         tf.cast(tf.range(num_timescales), py_utils.FPropDtype(p)) *
@@ -1759,7 +2644,8 @@ class PositionalEmbeddingLayer(base_layer.BaseLayer):
         inv_timescales, [1, 1, -1])
 
     signal = tf.concat([tf.sin(scaled_time), tf.cos(scaled_time)], axis=2)
-    signal = tf.pad(signal, [[0, 0], [0, 0], [0, tf.mod(p.embedding_dim, -1)]])
+    signal = tf.pad(
+        signal, [[0, 0], [0, 0], [0, tf.math.floormod(p.embedding_dim, -1)]])
     signal = tf.reshape(signal, [-1, seq_length, p.embedding_dim])
     if p.trainable_scaling:
       signal *= (p.trainable_scaling_init + theta.scale)
@@ -1818,6 +2704,58 @@ class PositionalEmbeddingLayer(base_layer.BaseLayer):
     return self._PosEmbeddingsFromPositions(theta, position)
 
 
+class RelativePositionalEmbeddingLayer(base_layer.BaseLayer):
+  """Relative positional embedding.
+
+  Section 3.2 of https://arxiv.org/pdf/1803.02155.pdf
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(RelativePositionalEmbeddingLayer, cls).Params()
+    p.Define(
+        'radius', None,
+        'Radius of the relative window size. Distance are clipped to '
+        '[-radius, radius].')
+    p.Define('dim', None, 'Dimension of embedding.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(RelativePositionalEmbeddingLayer, self).__init__(params)
+    params = self.params
+    if not isinstance(params.radius, numbers.Integral) or params.radius <= 0:
+      raise ValueError('params.radius must be a positive int, but is %s' %
+                       params.radius)
+    if not isinstance(params.dim, numbers.Integral) or params.dim <= 0:
+      raise ValueError('params.dim must be a positive int, but is %s' %
+                       params.radius)
+    pc = py_utils.WeightParams(
+        shape=[2 * params.radius + 1, params.dim],
+        init=py_utils.WeightInit.Constant(0.0),
+        dtype=params.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+    with tf.variable_scope(params.name):
+      self.CreateVariable('w', pc)
+
+  def FProp(self, theta, relative_distance):
+    """Computes relative positional embedding.
+
+    Args:
+      theta: A NestedMap of Tensors of layer weights.
+      relative_distance: A Tensor.
+
+    Returns:
+      A Tensor of shape relative_distance.shape + [params.dim]
+    """
+    params = self.params
+    clipped_indices = tf.clip_by_value(relative_distance, -params.radius,
+                                       params.radius)
+    # Right-shift indices to make them all non-negative.
+    calibrated_indices = clipped_indices + params.radius
+    return tf.gather_nd(theta.w, tf.expand_dims(calibrated_indices, -1))
+
+
 class SoftmaxLayer(quant_utils.QuantizableLayer):
   """Base class for softmax layers."""
 
@@ -1840,6 +2778,10 @@ class SoftmaxLayer(quant_utils.QuantizableLayer):
   def Logits(self, **unused):
     """Returns the logits computed before the softmax."""
     raise NotImplementedError('GetLogits is not implemented.')
+
+  def XentLossFromLogits(self, **unused):
+    """Returns the Xent loss from pre-computed logits."""
+    raise NotImplementedError('XentLossFromLogits is not implemented.')
 
   def XentLoss(self, *args, **kwargs):
     """Computes cross entropy."""
@@ -1907,7 +2849,9 @@ class SoftmaxLayer(quant_utils.QuantizableLayer):
     shape_mid = tf.shape(inputs[0])[1:-1]
 
     # Reshape inputs to matrices, labels to vectors, etc.
-    inputs = [tf.reshape(x, [-1, p.input_dim]) for x in inputs]
+    inputs = [
+        tf.reshape(x, py_utils.ToStaticShape([-1, p.input_dim])) for x in inputs
+    ]
     class_weights = tf.reshape(class_weights, [-1])
     if class_ids is not None:
       class_ids = tf.reshape(class_ids, [-1, 1])
@@ -1949,6 +2893,12 @@ class SimpleFullSoftmax(SoftmaxLayer):
         ' divide num_classes.')
     p.Define('apply_pruning', False,
              'Whether to prune the weights while training')
+    p.Define(
+        'use_num_classes_major_weight', False,
+        'Whether to use num_classes as major dimension for weight params. '
+        'This shows performance benefit especially when sharing embedding '
+        'and softmax. By removing the transpose before gather, it allows '
+        'better XLA fusions and optimizations.')
     return p
 
   @base_layer.initializer
@@ -1964,15 +2914,15 @@ class SimpleFullSoftmax(SoftmaxLayer):
     # shape=[num_classes_per_shard, p.input_dim] to avoid an expensive transpose
     # op before computing the sampled_softmax_loss.
     self._transpose_weight_params = False
-    self._weights_shard_shape = [p.input_dim, num_classes_per_shard]
-    if p.num_sampled:
+    weights_shard_shape = [p.input_dim, num_classes_per_shard]
+    if p.num_sampled or p.use_num_classes_major_weight:
       self._transpose_weight_params = True
-      self._weights_shard_shape = [num_classes_per_shard, p.input_dim]
+      weights_shard_shape = [num_classes_per_shard, p.input_dim]
     self.TrackQTensor('inputs', 'logits')
 
     with tf.variable_scope(p.name):
       pc = py_utils.WeightParams(
-          shape=self._weights_shard_shape,
+          shape=weights_shard_shape,
           init=p.params_init,
           dtype=p.dtype,
           collections=[self.__class__.__name__ + '_vars'])
@@ -2034,8 +2984,8 @@ class SimpleFullSoftmax(SoftmaxLayer):
     ]
     biases = [self.QWeight(theta['bias_%d' % i]) for i in range(p.num_shards)]
     new_theta = theta.copy()
-    new_theta.wm = py_utils.AddPerStepVN(p, tf.concat(
-        weights, axis=concat_axis))
+    new_theta.wm = py_utils.AddPerStepVN(p,
+                                         tf.concat(weights, axis=concat_axis))
     new_theta.bias = py_utils.AddPerStepVN(p, tf.concat(biases, axis=0))
     return new_theta
 
@@ -2060,6 +3010,28 @@ class SimpleFullSoftmax(SoftmaxLayer):
     if abs_max is not None and not p.is_inference:
       abs_min = -abs_max  # pylint: disable=invalid-unary-operand-type
       logits = py_utils.clip_by_value(logits, abs_min, abs_max)
+
+    return self.QTensor('logits', logits)
+
+  def SimpleLogits(self, theta, inputs):
+    """Returns the simple logits computed before the softmax.
+
+    Compared to the Logits function, this one has only weights, no bias for the
+    linear projection.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      inputs: A tensor with the shape [N, input_dim].
+
+    Returns:
+      logits: [N, num_classes]
+    """
+    inputs = self.QTensor('inputs', inputs)
+    theta = self._ConcatWeights(theta)
+    wm = self.QWeight(theta.wm)
+    logits = py_utils.Matmul(
+        inputs, wm, transpose_b=self._transpose_weight_params)
 
     return self.QTensor('logits', logits)
 
@@ -2143,25 +3115,16 @@ class SimpleFullSoftmax(SoftmaxLayer):
     p = self.params
     inputs = self._GetInputs(inputs)
     logits = self.Logits(theta, inputs)
-
     if class_probabilities is not None:
-      per_example_xent = tf.nn.softmax_cross_entropy_with_logits(
-          labels=class_probabilities, logits=logits)
-      per_example_argmax = py_utils.ArgMax(logits)
+      per_example_xent, per_example_argmax = self.XentLossFromLogits(
+          theta, logits, class_weights, class_ids, class_probabilities)
     elif p.chunk_size:
       class_ids = py_utils.HasShape(class_ids, [-1, 1])
       per_example_xent, per_example_argmax = self._XentLossByChunk(
           theta, inputs, class_ids)
-    elif p.num_sampled is 0 or p.is_eval:
-      assert class_ids is not None
-      assert logits is not None
-      tf.logging.vlog(
-          0, 'Using sparse_softmax_cross_entropy_with_logits() in '
-          'SimpleFullSoftmax::_FProp2D logits_shape=%r',
-          py_utils.GetShape(logits))
-      per_example_xent = tf.nn.sparse_softmax_cross_entropy_with_logits(
-          labels=tf.reshape(class_ids, [-1]), logits=logits)
-      per_example_argmax = py_utils.ArgMax(logits)
+    elif p.num_sampled == 0 or self.do_eval:
+      per_example_xent, per_example_argmax = self.XentLossFromLogits(
+          theta, logits, class_weights, class_ids, class_probabilities)
     else:  # Use sampled soft-max in training mode with p.num_sampled set.
       assert p.num_sampled > 0
       tf.logging.vlog(
@@ -2176,7 +3139,6 @@ class SimpleFullSoftmax(SoftmaxLayer):
           inputs=self._GetInputs(inputs),
           num_sampled=p.num_sampled,
           num_classes=p.num_classes,
-          partition_strategy='div',
           seed=p.random_seed)
       # Avoid computing logits; per_example_argmax is going to be always right.
       per_example_argmax = tf.identity(class_ids)
@@ -2185,7 +3147,6 @@ class SimpleFullSoftmax(SoftmaxLayer):
         tf.cast(class_weights, py_utils.FPropDtype(p)), [-1])
     total_xent = tf.reduce_sum(per_example_xent * label_weights)
     total_weights = tf.reduce_sum(label_weights)
-
     return py_utils.NestedMap(
         logits=logits,
         log_probs=tf.nn.log_softmax(logits),
@@ -2195,6 +3156,269 @@ class SimpleFullSoftmax(SoftmaxLayer):
         total_xent=total_xent,
         total_weight=total_weights,
         avg_xent=total_xent / total_weights)
+
+  def XentLossFromLogits(self,
+                         theta,
+                         logits,
+                         class_weights,
+                         class_ids=None,
+                         class_probabilities=None):
+    """Computes cross-entropy, argmax etc. from logits."""
+    p = self.params
+    assert logits is not None
+    if class_probabilities is not None:
+      per_example_xent = tf.nn.softmax_cross_entropy_with_logits(
+          labels=class_probabilities, logits=logits)
+      per_example_argmax = py_utils.ArgMax(logits)
+    elif p.num_sampled == 0 or self.do_eval:
+      assert class_ids is not None
+      tf.logging.vlog(
+          0, 'Using sparse_softmax_cross_entropy_with_logits() in '
+          'SimpleFullSoftmax::_FProp2D logits_shape=%r',
+          py_utils.GetShape(logits))
+      per_example_xent = tf.nn.sparse_softmax_cross_entropy_with_logits(
+          labels=tf.reshape(class_ids, [-1]), logits=logits)
+      per_example_argmax = py_utils.ArgMax(logits)
+    else:
+      raise ValueError(
+          'This set of arguments is not supported for XentLossFromLogits.')
+    return per_example_xent, per_example_argmax
+
+
+class SharedSoftmaxLayer(SimpleFullSoftmax):
+  """Shared softmax layer for decoder embedding/softmax matrix."""
+
+  @classmethod
+  def Params(cls):
+    """Params for SharedSoftmaxLayer."""
+    p = super(SharedSoftmaxLayer, cls).Params()
+    p.Define(
+        'scale_sqrt_depth', False, 'If set True, activations are scaled'
+        ' with sqrt(input_dim) in EmbLookup.')
+    return p
+
+  def EmbLookup(self, theta, ids):
+    p = self.params
+    if not py_utils.use_xla():
+      ids = py_utils.with_dependencies([
+          py_utils.assert_between(
+              ids, 0, p.num_classes, name='class_id_validation')
+      ], ids)
+
+    wm = self._ConcatWeights(theta).wm
+    if not self._transpose_weight_params:
+      wm = tf.transpose(wm)
+    embs_result = tf.gather(wm, ids)
+
+    if p.scale_sqrt_depth:
+      embs_result *= p.input_dim**0.5
+
+    return embs_result
+
+
+class SingleShardFullSoftmax(SoftmaxLayer):
+  """Full softmax layer."""
+
+  @base_layer.initializer
+  def __init__(self, params):
+    """Constructs a SingleShardFullSoftmax layer."""
+    super(SingleShardFullSoftmax, self).__init__(params)
+    p = self.params
+    assert p.name
+    with tf.variable_scope(p.name):
+      linear_p = builder_layers.LinearLayer.Params().Set(
+          name='linear', input_dims=p.input_dim, output_dims=p.num_classes)
+      self.CreateChild('linear', linear_p)
+      bias_p = builder_layers.BiasLayer.Params().Set(
+          name='bias', dims=p.num_classes)
+      self.CreateChild('bias', bias_p)
+
+  def Logits(self, theta, inputs):
+    """Returns the logits computed before the softmax.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      inputs: A single tensor with shape [..., input_dim].
+
+    Returns:
+      logits [..., num_classes]
+    """
+    p = self.params
+    if isinstance(inputs, (list, tuple)):
+      assert len(inputs) == 1
+      inputs = inputs[0]
+    after_proj = self.linear.FProp(theta.linear, inputs)
+    logits = self.bias.FProp(theta.bias, after_proj)
+    # Clip logits by range.
+    # Note that this is generally not used in conjunction with quantization and
+    # shouldn't be needed at inference time as the quantized matmul above will
+    # take care of clipping naturally based on the data type and qparams.
+    abs_max = p.logits_abs_max
+    if abs_max is not None and not p.is_inference:
+      abs_min = -abs_max  # pylint: disable=invalid-unary-operand-type
+      logits = py_utils.clip_by_value(logits, abs_min, abs_max)
+    return logits
+
+  def XentLossFromLogits(self,
+                         theta,
+                         logits,
+                         class_ids=None,
+                         class_probabilities=None):
+    """Computes cross-entropy, argmax etc. from logits."""
+    assert logits is not None
+    if class_probabilities is not None:
+      per_example_xent = tf.nn.softmax_cross_entropy_with_logits(
+          labels=class_probabilities, logits=logits)
+      per_example_argmax = tf.stop_gradient(py_utils.ArgMax(logits))
+    else:
+      assert class_ids is not None
+      per_example_xent = tf.nn.sparse_softmax_cross_entropy_with_logits(
+          labels=class_ids, logits=logits)
+      per_example_argmax = tf.stop_gradient(py_utils.ArgMax(logits))
+    return per_example_xent, per_example_argmax
+
+  def XentLossByChunk(self, theta, activation, class_ids, class_probabilities):
+    """Computes per-example xent loss."""
+    p = self.params
+
+    act_orig_shape = tf.shape(activation)
+    batch_size = act_orig_shape[0]
+    chunk_size = p.chunk_size
+    num_chunks = batch_size // chunk_size
+
+    num_chunks = py_utils.with_dependencies([
+        py_utils.assert_equal(
+            0,
+            tf.math.floormod(batch_size, chunk_size),
+            summarize=2,
+            message='assert_equal')
+    ], num_chunks)
+
+    def ReshapeX(x):
+      if x is None:
+        return None
+      x_shape = tf.shape(x)
+      new_shape = tf.concat([[num_chunks, chunk_size], x_shape[1:]], 0)
+      return tf.reshape(x, new_shape)
+
+    activation = ReshapeX(activation)
+    class_ids = ReshapeX(class_ids)
+    class_probabilities = ReshapeX(class_probabilities)
+
+    # For each chunk, we compute logits of activation[i, :, :],
+    # and its xent loss with class_ids[i, :].
+    def ChunkFn(theta, state0, inputs):
+      del state0
+      activation = inputs.activation
+      class_ids = inputs.get('class_ids', None)
+      class_probabilities = inputs.get('class_probabilities', None)
+      logits = self.Logits(theta, activation)
+      per_example_xent, per_example_argmax = self.XentLossFromLogits(
+          theta, logits, class_ids, class_probabilities)
+      return py_utils.NestedMap(xent=per_example_xent,
+                                amax=per_example_argmax), py_utils.NestedMap()
+
+    inputs_nmap = py_utils.NestedMap(activation=activation)
+    if class_ids is not None:
+      inputs_nmap.class_ids = class_ids
+    if class_probabilities is not None:
+      inputs_nmap.class_probabilities = class_probabilities
+
+    xent_state0 = tf.zeros(tf.shape(activation)[1:-1], dtype=p.dtype)
+    argmax_out_dtype = tf.int32 if py_utils.use_tpu() else tf.int64
+    amax_state0 = tf.zeros(tf.shape(activation)[1:-1], dtype=argmax_out_dtype)
+
+    acc, _ = recurrent.Recurrent(
+        theta=theta,
+        state0=py_utils.NestedMap(xent=xent_state0, amax=amax_state0),
+        inputs=inputs_nmap,
+        cell_fn=ChunkFn)
+
+    # acc.xent has the shape [dim0, dim1]. acc.xent[i, :] are
+    # per-example xent loss for examples in the i-th chunk.  We
+    # reshape acc.xent to a vector and slice the first 'batch' values.
+    def GetBatch(x):
+      return tf.reshape(x, act_orig_shape[:-1])
+
+    return GetBatch(acc.xent), GetBatch(acc.amax)
+
+  def FProp(self,
+            theta,
+            inputs,
+            class_weights,
+            class_ids=None,
+            class_probabilities=None):
+    """Computes logits, cross entropy etc.
+
+    Args:
+      theta: A `.NestedMap` object containing weights' values of this layer and
+        its children layers.
+      inputs: a single tensor with shape [..., input_dim].
+      class_weights: a tensor with shape [..., 1] containing the weights for
+        each target word.
+      class_ids: a tensor with shape [..., 1] of int32 dtype containing the
+        target class labels.
+      class_probabilities: a tensor with shape [..., num_classes] of float
+        values indicating class-membership probabilities.
+
+    Returns:
+      A `.NestedMap` containing the following fields
+
+      - logits: with shape [..., num_classes]. Unnormalized softmax's logits.
+      - per_example_argmax: with shape [...]. argmax of i-th example.
+      - per_example_xent: with shape [...]. Cross entropy between i-th example's
+        prediction and its label.
+      - per_example_weight: with shape [...]. class_weights casted to
+        this layer's dtype.
+      - total_xent: A scalar. The sum of per_example_weight * per_example_xent.
+      - total_weight: A scalar. The sum of per_example_weight.
+      - avg_xent: A scalar. total_loss / total_weight.
+    """
+    p = self.params
+    if isinstance(inputs, (list, tuple)):
+      assert len(inputs) == 1
+      inputs = inputs[0]
+
+    inputs_shape = tf.shape(inputs)
+    ids_shape = tf.concat([inputs_shape[:-1], [1]], 0)
+    probs_shape = tf.concat([inputs_shape[:-1], [p.num_classes]], 0)
+
+    class_weights = py_utils.HasShape(class_weights, ids_shape)
+    class_weights = tf.squeeze(class_weights, -1)
+    if class_ids is not None:
+      class_ids = py_utils.HasShape(class_ids, ids_shape)
+      class_ids = tf.squeeze(class_ids, -1)
+    if class_probabilities is not None:
+      class_probabilities = py_utils.HasShape(class_probabilities,
+                                              probs_shape)
+
+    if (not self.do_eval) and (p.chunk_size > 0):
+      # Chunking.
+      logits = None
+      log_probs = None
+      per_example_xent, per_example_argmax = self.XentLossByChunk(
+          theta, inputs, class_ids, class_probabilities)
+    else:
+      logits = self.Logits(theta, inputs)
+      log_probs = tf.nn.log_softmax(logits)
+      per_example_xent, per_example_argmax = self.XentLossFromLogits(
+          theta, logits, class_ids, class_probabilities)
+
+    label_weights = tf.cast(class_weights, py_utils.FPropDtype(p))
+    total_xent = tf.reduce_sum(per_example_xent * label_weights)
+    total_weights = tf.reduce_sum(label_weights)
+    output_nmap = py_utils.NestedMap(
+        per_example_argmax=per_example_argmax,
+        per_example_xent=per_example_xent,
+        per_example_weight=label_weights,
+        total_xent=total_xent,
+        total_weight=total_weights,
+        avg_xent=total_xent / (total_weights + 1e-6))
+    if logits is not None:
+      output_nmap.logits = logits
+      output_nmap.log_probs = log_probs
+    return output_nmap
 
 
 class ConvSoftmax(quant_utils.QuantizableLayer):
@@ -2257,107 +3481,6 @@ class ConvSoftmax(quant_utils.QuantizableLayer):
         return logits
 
 
-class FeedForwardNet(quant_utils.QuantizableLayer):
-  """A simple multiple layer feedforward network.
-
-  This class represents a stack of fully connected feedforward network. Each
-  layer in the network can be configured for whether or not to have batch-norm
-  applied to its output, its activation function, whether or not to apply
-  dropout to post-activation output.
-  """
-
-  @classmethod
-  def Params(cls):
-    p = super(FeedForwardNet, cls).Params()
-    p.Define('input_dim', 0, 'Depth of the input to the network.')
-    p.Define('hidden_layer_dims', [], 'Depth of the hidden layer outputs.')
-    p.Define(
-        'dropout', DropoutLayer.Params(),
-        'Dropout layer params. Can be a single params or a tuple/list of params'
-        ' having the same length as the number of layers.')
-    p.Define(
-        'batch_norm', False,
-        'Whether or not to apply BN to hidden layer output. '
-        'This can be a single bool or a tuple/list of bools having the'
-        ' same length as the number of layers.')
-    p.Define(
-        'activation', 'RELU',
-        'The activation function to use. Can be a single string, or a'
-        ' tuple/list of strings having the same length as the number'
-        ' of layers.')
-    p.Define('skip_connections', None, 'Must be None.')
-    p.Define(
-        'bn_fold_weights', None, 'Force folding the batch normalization '
-        'weights in the projection layer.')
-    return p
-
-  @base_layer.initializer
-  def __init__(self, params):
-    super(FeedForwardNet, self).__init__(params)
-    p = self.params
-    assert p.name
-
-    assert p.skip_connections is None
-    batch_norm = p.batch_norm
-    num_layers = len(p.hidden_layer_dims)
-    if isinstance(batch_norm, (list, tuple)):
-      assert len(batch_norm) == num_layers
-    else:
-      batch_norm = [batch_norm] * num_layers
-    activation = p.activation
-    if isinstance(activation, six.string_types):
-      activation = [activation] * num_layers
-    else:
-      assert len(activation) == num_layers
-    params_dropout_layers = p.dropout
-    if isinstance(params_dropout_layers, (list, tuple)):
-      assert len(params_dropout_layers) == num_layers
-    else:
-      params_dropout_layers = [params_dropout_layers] * num_layers
-
-    with tf.variable_scope(p.name):
-      # Residual connections work better in the form of:
-      #   y = x + Affine(Activation(BatchNorm(x)))
-      params_fc_layers = []
-      in_dim = p.input_dim
-      for i in range(num_layers):
-        out_dim = p.hidden_layer_dims[i]
-        proj_out_dim = out_dim
-        name = '%s_%d' % (p.name, i)
-        params_i = ProjectionLayer.Params().Set(
-            batch_norm=batch_norm[i],
-            has_bias=(not batch_norm[i]),
-            activation=activation[i],
-            input_dim=in_dim,
-            output_dim=proj_out_dim,
-            bn_fold_weights=p.bn_fold_weights,
-            name=name)
-        params_fc_layers.append(params_i)
-        in_dim = out_dim
-
-        if p.qdomain.default is not None:
-          params_i.qdomain.default = p.qdomain.default.Copy()
-
-      self.CreateChildren('fc', params_fc_layers)
-      self.CreateChildren('dropout', params_dropout_layers)
-
-  def FProp(self, theta, inputs, paddings=None):
-    p = self.params
-    num_layers = len(self.fc)
-
-    in_dim, layer_in = p.input_dim, inputs
-    for i in range(num_layers):
-      layer_in = py_utils.with_dependencies(
-          [py_utils.assert_shape_match([tf.shape(layer_in)[-1]], [in_dim])],
-          layer_in)
-      out_dim = p.hidden_layer_dims[i]
-      layer_out = self.fc[i].FProp(theta.fc[i], layer_in, paddings)
-      layer_out = self.dropout[i].FProp(theta.dropout[i], layer_out)
-      layer_in = layer_out
-      in_dim = out_dim
-    return layer_in
-
-
 class DropoutLayer(base_layer.BaseLayer):
   """Apply dropout during trainig."""
 
@@ -2365,15 +3488,33 @@ class DropoutLayer(base_layer.BaseLayer):
   def Params(cls):
     p = super(DropoutLayer, cls).Params()
     p.Define('keep_prob', 1.0, 'Keep probability.')
+    # noise_shape is unknown when building layer params.
     p.Define(
         'noise_shape', None, 'A 1-D `Tensor` of type `int32`, representing'
         ' the shape for randomly generated keep/drop flags.')
+    p.Define(
+        'noise_shape_broadcast_dims', None,
+        'A list of dimension where the noise shape is broadcasted. For '
+        'example, noise_shape = [n, h, w, 1] when '
+        'noise_shape_broadcast_dims=[-1] ')
     # We typically want to replace dropout by expectation during eval.
     # However, in certain cases E(f(x)) != f(E(x)), and replacing dropout by its
     # expectation during eval leads to worse quality.
     p.Define('dropout_at_eval', False,
              'Whether or not to also perform dropout at eval time.')
     return p
+
+  def _Dropout(self, theta, inputs, noise_shape):
+    return tf.nn.dropout(
+        inputs,
+        rate=1 - self.params.keep_prob,
+        noise_shape=noise_shape,
+        seed=self.params.random_seed)
+
+  @classmethod
+  def NumOutputNodes(cls, p):
+    # The layer does element-wise processing thus is input-shape agnostic.
+    return
 
   def FProp(self, theta, inputs):
     """Apply dropout to inputs.
@@ -2387,12 +3528,20 @@ class DropoutLayer(base_layer.BaseLayer):
       inputs with dropout applied at training time.
     """
     p = self.params
-    if p.keep_prob < 1.0 and (not p.is_eval or p.dropout_at_eval):
-      return tf.nn.dropout(
-          inputs,
-          keep_prob=p.keep_prob,
-          noise_shape=p.noise_shape,
-          seed=p.random_seed)
+    if not self.do_eval or p.dropout_at_eval:
+      if isinstance(p.keep_prob, numbers.Real) and p.keep_prob == 1.0:
+        return inputs
+      if p.noise_shape_broadcast_dims:
+        noise_shape = p.noise_shape or py_utils.GetShape(inputs)
+        for dim in p.noise_shape_broadcast_dims:
+          if dim >= len(noise_shape):
+            raise ValueError('Invalid broadcasted dim {}'.format(dim))
+          noise_shape[dim] = 1
+      else:
+        noise_shape = p.noise_shape
+      ret = self._Dropout(theta, inputs, noise_shape)
+      ret.set_shape(inputs.get_shape())
+      return ret
     else:
       return inputs
 
@@ -2404,37 +3553,15 @@ class DropoutLayer(base_layer.BaseLayer):
         flops=inputs.num_elements() * flops_per_element, out_shapes=(inputs,))
 
 
-class DeterministicDropoutLayer(base_layer.BaseLayer):
+class DeterministicDropoutLayer(DropoutLayer):
   """Apply dropout during trainig."""
 
-  @classmethod
-  def Params(cls):
-    p = super(DeterministicDropoutLayer, cls).Params()
-    p.Define('keep_prob', 1.0, 'Keep probability.')
-    # We typically want to replace dropout by expectation during eval.
-    # However, in certain cases E(f(x)) != f(E(x)), and replacing dropout by its
-    # expectation during eval leads to worse quality.
-    p.Define('dropout_at_eval', False,
-             'Whether or not to also perform dropout at eval time.')
-    return p
-
-  def FProp(self, theta, inputs):
-    """Apply dropout to inputs.
-
-    Args:
-      theta: A `.NestedMap` object containing weights' values of this layer and
-        its children layers.
-      inputs: The inputs tensor.
-
-    Returns:
-      inputs with dropout applied at training time.
-    """
-    p = self.params
-    if p.keep_prob < 1.0 and (not p.is_eval or p.dropout_at_eval):
-      return py_utils.DeterministicDropout(
-          inputs, p.keep_prob, py_utils.GetOpSeedPair(op_seed=p.random_seed))
-    else:
-      return inputs
+  def _Dropout(self, theta, inputs, noise_shape):
+    return py_utils.DeterministicDropout(
+        inputs,
+        keep_prob=self.params.keep_prob,
+        seeds=py_utils.GenerateStepSeedPair(self.params, theta.global_step),
+        noise_shape=noise_shape)
 
 
 class LayerNorm(base_layer.BaseLayer):
@@ -2449,6 +3576,7 @@ class LayerNorm(base_layer.BaseLayer):
     p = super(LayerNorm, cls).Params()
     p.Define('input_dim', 0, 'Depth of the input to the network.')
     p.Define('epsilon', 1e-6, 'Tiny value to guard rsqrt.')
+    p.Define('use_fused_layernorm', False, 'Whether to use fused layernorm.')
     return p
 
   @base_layer.initializer
@@ -2481,7 +3609,15 @@ class LayerNorm(base_layer.BaseLayer):
     inputs = py_utils.with_dependencies(
         [py_utils.assert_equal(tf.shape(inputs)[-1], p.input_dim)], inputs)
 
-    @function.Defun(
+    if p.use_fused_layernorm:
+      counts, means_ss, variance_ss, _, = tf.nn.sufficient_statistics(
+          inputs, axes=[-1], keepdims=True)
+      mean, variance = tf.nn.normalize_moments(counts, means_ss, variance_ss,
+                                               None)
+      inputs_norm = (inputs - mean) * tf.math.rsqrt(variance + p.epsilon)
+      return inputs_norm * (1.0 + theta.scale) + theta.bias
+
+    @tf.Defun(
         *[py_utils.FPropDtype(p)] * 3,
         noinline=not py_utils.use_tpu(),
         shape_func=lambda op: [op.inputs[0].shape])
@@ -2493,11 +3629,21 @@ class LayerNorm(base_layer.BaseLayer):
       mean = tf.reduce_mean(x_reshaped, axis=[1], keepdims=True)
       variance = tf.reduce_mean(
           tf.square(x_reshaped - mean), axis=[1], keepdims=True)
-      x_norm = (x_reshaped - mean) * tf.rsqrt(variance + p.epsilon)
+      x_norm = (x_reshaped - mean) * tf.math.rsqrt(variance + p.epsilon)
       x_norm = tf.reshape(x_norm, x_shape)
       return x_norm * (1.0 + scale) + bias
 
     return Normalize(inputs, theta.scale, theta.bias)
+
+  @classmethod
+  def NumOutputNodes(cls, p):
+    return p.input_dim
+
+  @classmethod
+  def FPropMeta(cls, p, inputs):
+    py_utils.CheckShapes((inputs,))
+    return py_utils.NestedMap(
+        flops=inputs.num_elements() * 10, out_shapes=(inputs,))
 
 
 class ConvSetLayer(quant_utils.QuantizableLayer):
@@ -2733,7 +3879,7 @@ class UniformLabelSmoother(base_layer.BaseLayer):
     del target_paddings  # Unused by FProp.
     p = self.params
 
-    low_confidence = p.uncertainty / tf.to_float(p.num_classes - 1)
+    low_confidence = p.uncertainty / tf.cast(p.num_classes - 1, tf.float32)
     high_confidence = (1.0 - p.uncertainty)
 
     smooth_targets = tf.one_hot(
@@ -2743,8 +3889,8 @@ class UniformLabelSmoother(base_layer.BaseLayer):
         off_value=low_confidence)
     if p.token_id_uncertainty_larger is not None:
       assert target_ids is not None
-      low_confidence_larger = p.uncertainty_larger / tf.to_float(p.num_classes -
-                                                                 1)
+      low_confidence_larger = p.uncertainty_larger / tf.cast(
+          p.num_classes - 1, tf.float32)
       high_confidence_larger = (1.0 - p.uncertainty_larger)
       smooth_targets_larger = tf.one_hot(
           tf.cast(target_labels, tf.int32),
@@ -2851,7 +3997,7 @@ class GradNormTracker(base_layer.BaseLayer):
         'Distance threshold at which gradients are clipped to 0.0.'
         ' Distance is measured in the number of standard deviations a'
         ' given gradient norm is from the mean gradient norm. The'
-        ' default value of 3.0 means we are throwing away roughly'
+        ' default value of 4.0 means we are throwing away roughly'
         ' 0.15% of steps.')
     p.Define(
         'grad_norm_clip_cap_min', 0.0,
@@ -2920,9 +4066,9 @@ class GradNormTracker(base_layer.BaseLayer):
                            tf.exp(mean + std * p.clip_threshold) - 1.0)
       summary_utils.scalar('total_rejections', self._total_rejections)
 
-      log_grad_norm = tf.log(grad_norm + 1.0)
+      log_grad_norm = tf.math.log(grad_norm + 1.0)
       log_grad_norm_cap = mean + std * p.clip_threshold
-      log_grad_norm_cap_min = tf.log(p.grad_norm_clip_cap_min + 1.0)
+      log_grad_norm_cap_min = tf.math.log(p.grad_norm_clip_cap_min + 1.0)
       log_grad_norm_cap = tf.maximum(log_grad_norm_cap, log_grad_norm_cap_min)
 
       def UpdateExpMovingAvg(ref_var, val, ignore):
@@ -2935,10 +4081,10 @@ class GradNormTracker(base_layer.BaseLayer):
 
       # We trigger when total_weight is at least half of max weight or the
       # current batch contains NaNs.
-      trigger = tf.logical_and(log_grad_norm > log_grad_norm_cap,
-                               total_weight > 0.75)
+      trigger = tf.math.logical_and(log_grad_norm > log_grad_norm_cap,
+                                    total_weight > 0.75)
       if has_nan is not None:
-        trigger = tf.logical_or(trigger, has_nan)
+        trigger = tf.math.logical_or(trigger, has_nan)
 
       log_grad_norm_capped = tf.minimum(log_grad_norm, log_grad_norm_cap)
 
@@ -3199,3 +4345,466 @@ class ResidualAdapterLayer(base_layer.BaseLayer):
     bottleneck_x = self.bottleneck.FProp(theta.bottleneck, normalized_x,
                                          paddings)
     return x + bottleneck_x
+
+
+def Conv2DFlops(inputs, filter_shape, stride, padding):
+  """Returns number of float operations (mult/adds) for a Conv2D op.
+
+  Args:
+    inputs: the input shape. Must have four elements.
+    filter_shape: the convolution filter shape. Must have four elements.
+    stride: the strides along height and width, respectively.
+    padding: 'SAME' or 'VALID'.
+
+  Returns:
+    Number of multiplications and additions.
+  """
+  b, h, w = inputs[0], inputs[1], inputs[2]
+  fh, fw, ic, oc = filter_shape
+  sh, sw = stride
+
+  def _CeilDiv(x, y):
+    return tf.math.floordiv(x + y - 1, y)
+
+  if padding == 'SAME':
+    oh = _CeilDiv(h, sh)
+    ow = _CeilDiv(w, sw)
+  else:
+    assert padding == 'VALID'
+    oh = _CeilDiv(h - fh + 1, sh)
+    ow = _CeilDiv(w - fw + 1, sw)
+  # Mul/add counts as 2 flops.
+  return (tf.cast(b * oh * ow, tf.int64) *
+          tf.cast(fh * fw * ic * oc, tf.int64) * 2)
+
+
+class Conv2DLayerNoPadding(base_layer.BaseLayer):
+  """2-D Convolution layer w/o padding.
+
+  TODO(laurenzo): Dedup in favor of SeparableConv2DLayer where possible.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(Conv2DLayerNoPadding, cls).Params()
+    p.Define(
+        'filter_shape', (0, 0, 0, 0),
+        'Filter shape. Must be a sequence of length 4. Elements are in'
+        ' the order of height (time), width (frequency), in_channel,'
+        ' out_channel. ')
+    p.Define(
+        'filter_stride', (0, 0),
+        'Filter stride to use. Must be a pair of ints. The first int'
+        ' specifies the stride on the height dimension. The second int'
+        ' specifies the stride on the width dimension.')
+    p.Define(
+        'dilations', (1, 1), ' An optional list of ints. Defaults to [1, 1]. '
+        '1-D tensor of length 2. The dilation factor for each dimension '
+        'of input. If set to k > 1, there will be k-1 skipped cells '
+        'between each filter element on that dimension.')
+    p.Define('padding', 'SAME', 'SAME|VALID')
+
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(Conv2DLayerNoPadding, self).__init__(params)
+    p = self.params
+    assert p.name
+    assert p.padding in ['SAME', 'VALID']
+    assert len(p.filter_shape) == 4
+    assert len(p.filter_stride) == 2
+    assert len(p.dilations) == 2
+    assert all(x > 0 for x in p.filter_stride)
+    self._CreateConvVariables()
+
+  def _CreateConvVariables(self):
+    p = self.params
+    w_pc = py_utils.WeightParams(
+        shape=p.filter_shape,
+        init=p.params_init,
+        dtype=p.dtype,
+        collections=[self.__class__.__name__ + '_vars'])
+    with tf.variable_scope(p.name):
+      self.CreateVariable('w', w_pc)
+
+  def FProp(self, theta, x):
+    """Apply convolution to inputs.
+
+    Args:
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
+      x: The inputs tensor. It is expected to be of shape [batch, height, width,
+        channel].
+
+    Returns:
+      Convolution output.
+    """
+    p = self.params
+    with tf.name_scope(p.name):
+      computation_cost.Add(
+          self, 'flops',
+          Conv2DFlops(
+              tf.shape(x),
+              filter_shape=symbolic.EvalExpr(symbolic.TENSOR_VALUES,
+                                             p.filter_shape),
+              stride=p.filter_stride,
+              padding=p.padding))
+      return tf.nn.conv2d(
+          input=x,
+          filters=theta.w,
+          strides=[1, p.filter_stride[0], p.filter_stride[1], 1],
+          padding=p.padding,
+          dilations=[1, p.dilations[0], p.dilations[1], 1],
+          data_format='NHWC')
+
+  @classmethod
+  def FPropMeta(cls, p, inputs):
+    py_utils.CheckShapes((inputs,))
+    b, h, w, c = inputs
+    fh, fw, ic, oc = p.filter_shape
+    assert ic == c
+    sh, sw = p.filter_stride
+    if p.padding == 'SAME':
+      oh = sympy.ceiling(h / sh)
+      ow = sympy.ceiling(w / sw)
+    else:
+      oh = sympy.ceiling((h - fh + 1) / sh)
+      ow = sympy.ceiling((w - fw + 1) / sw)
+    flops = b * oh * ow * fh * fw * ic * oc * 2  # mul/add counts as 2 flop.
+    outputs = tshape.Shape([b, oh, ow, oc])
+    return py_utils.NestedMap(flops=flops, out_shapes=(outputs,))
+
+
+class FetchLayer(base_layer.BaseLayer):
+  """A layer facilitating fetching activations and their gradients."""
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(FetchLayer, self).__init__(params)
+    assert self.params.name
+    self._activations = None
+    self._gradients = None
+
+  @classmethod
+  def FPropMeta(cls, params, *args):
+    return py_utils.NestedMap(flops=0, out_shapes=args)
+
+  def _ReturnSingleValueOrList(self, lst):
+    assert lst is not None
+    assert isinstance(lst, list)
+    return lst if len(lst) > 1 else lst[0]
+
+  @property
+  def activation(self):
+    return self._ReturnSingleValueOrList(self._activations)
+
+  @property
+  def gradient(self):
+    return self._ReturnSingleValueOrList(self._gradients)
+
+  def FProp(self, theta, *args):
+    del theta
+    num = len(args)
+    self._activations = [None] * num
+    self._gradients = [None] * num
+
+    for i, v in enumerate(args):
+
+      def ShapeFunc(op):
+        return [op.inputs[0].shape]
+
+      def FetchBak(op, dy, index=i):
+        del op
+        self._gradients[index] = dy
+        return dy
+
+      @tf.Defun(v.dtype, shape_func=ShapeFunc, python_grad_func=FetchBak)
+      def FetchFwd(x):
+        return x
+
+      self._activations[i] = FetchFwd(v)
+
+    return tuple(self._activations) if num > 1 else self._activations[0]
+
+
+class GluLayer(base_layer.BaseLayer):
+  """Gated Linear Unit.
+
+  See https://arxiv.org/abs/1612.08083 for more details.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(GluLayer, cls).Params()
+    p.Define('input_dim', 0, 'Dimension of the layer input.')
+    p.Define('output_dim', 0, 'Dimension of the layer output.')
+    p.Define('ln_tpl', LayerNorm.Params(), 'Layer norm default params.')
+    p.Define('dense_tpl', FCLayer.Params().Set(), 'Fully connected layer.')
+    p.Define(
+        'activation', 'RELU',
+        'Non-linearity applied after the dense layer in the value branch.')
+    p.Define('dropout_tpl', DropoutLayer.Params(), 'Dropout applied to output.')
+    p.Define('apply_residual', True, 'Whether or not to add inputs to outputs.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(GluLayer, self).__init__(params)
+    p = self.params
+    assert p.name
+    assert p.input_dim
+
+    if p.output_dim:
+      output_dim = p.output_dim
+    else:
+      output_dim = p.input_dim
+
+    if p.apply_residual:
+      assert output_dim == p.input_dim
+
+    with tf.variable_scope(p.name):
+      # Initialize value feed-forward layer.
+      params = p.dense_tpl.Copy()
+      params.name = 'value_layer'
+      params.input_dim = p.input_dim
+      params.activation = p.activation
+      params.output_dim = output_dim
+      self.CreateChild('value_layer', params)
+
+      # Initialize gate feed-forward layer.
+      params = p.dense_tpl.Copy()
+      params.name = 'gate_layer'
+      params.input_dim = p.input_dim
+      params.activation = 'SIGMOID'
+      params.output_dim = output_dim
+      self.CreateChild('gate_layer', params)
+
+      # Initialize layer norm.
+      params = p.ln_tpl.Copy()
+      params.name = 'layer_norm'
+      params.input_dim = p.input_dim
+      self.CreateChild('layer_norm', params)
+
+      # Initialize dropout.
+      dropout_tpl = p.dropout_tpl.Copy()
+      self.CreateChild('dropout', dropout_tpl)
+
+  def FProp(self, theta, inputs, paddings):
+    inputs_normalized = self.layer_norm.FProp(theta.layer_norm, inputs)
+    values = self.value_layer.FProp(theta.value_layer, inputs_normalized,
+                                    tf.expand_dims(paddings, -1))
+    gates = self.gate_layer.FProp(theta.gate_layer, inputs_normalized,
+                                  tf.expand_dims(paddings, -1))
+    glu_output = values * gates
+    glu_output = self.dropout.FProp(theta.dropout, glu_output)
+    if self.params.apply_residual:
+      return inputs + glu_output
+    return glu_output
+
+
+class MultitaskAdapterLayer(base_layer.BaseLayer):
+  """Residual adapter layer for multilingual models.
+
+  Residual adapters can be used to fine-tune a single model to multiple
+  domains, tasks, or languages: https://arxiv.org/pdf/1902.00751.pdf
+
+  Each adapter consists of a "down" projection to a smaller dimension followed
+  by an "up" projection, the result of which is added back to the input
+  activation.  The projection weights and biases are task-specific.
+
+  Whereas ResidualAdapterLayer learns and applies the parameters for a single
+  task, this layer learns and applies the parameters for multiple tasks so that
+  we have a single model serving the different tasks. The parameters can be
+  trained for all tasks at the same time, or in one-off per-task training jobs.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(MultitaskAdapterLayer, cls).Params()
+    p.Define('num_tasks', 0, 'Number of tasks.')
+    p.Define('input_dim', 0, 'Dimension of the input to the adapter.')
+    p.Define('bottleneck_dim', 0, 'Dimension of the bottleneck.')
+    p.Define('layer_norm_tpl', LayerNorm.Params(), 'Layer norm default params.')
+    p.Define(
+        'projection_params_init', None,
+        'Weight initialization for up and down projections. Only used for '
+        'weights, not biases.  If None, uses default weight init, which is '
+        'typically Xavier with scale of 1.0.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(MultitaskAdapterLayer, self).__init__(params)
+    p = self.params
+    assert p.name
+    with tf.variable_scope(p.name):
+      base_emb_params = EmbeddingLayer.Params().Set(
+          vocab_size=p.num_tasks, max_num_shards=1)
+      down_proj_w_params = base_emb_params.Copy()
+      down_proj_w_params.Set(
+          embedding_dim=p.input_dim * p.bottleneck_dim, name='down_proj_w')
+      if p.projection_params_init:
+        down_proj_w_params.params_init = p.projection_params_init
+      down_proj_b_params = base_emb_params.Copy()
+      down_proj_b_params.Set(embedding_dim=p.bottleneck_dim, name='down_proj_b')
+      up_proj_w_params = base_emb_params.Copy()
+      up_proj_w_params.Set(
+          embedding_dim=p.bottleneck_dim * p.input_dim, name='up_proj_w')
+      if p.projection_params_init:
+        up_proj_w_params.params_init = p.projection_params_init
+      up_proj_b_params = base_emb_params.Copy()
+      up_proj_b_params.Set(embedding_dim=p.input_dim, name='up_proj_b')
+    with tf.variable_scope(p.name):
+      self.CreateChild('down_proj_w', down_proj_w_params)
+      self.CreateChild('down_proj_b', down_proj_b_params)
+      self.CreateChild('up_proj_w', up_proj_w_params)
+      self.CreateChild('up_proj_b', up_proj_b_params)
+      params = p.layer_norm_tpl.Copy()
+      params.name = 'adapter_ln'
+      params.input_dim = p.input_dim
+      self.CreateChild('layer_norm', params)
+
+  def FProp(self, theta, inputs, tasks):
+    """Fprop for multitask adapter.
+
+    Args:
+      theta: A NestedMap object containing weights' values of this layer and its
+        children layers.
+      inputs: A tensor containing the activations from the previous layer of
+        shape [time, batch, input_dim].
+      tasks: An int32 tensor containing the task ID for each input.  If 'tasks'
+        is of rank 2, we assume it to be of shape [time, batch], indicating a
+        different task for each timestep.  In this case we look up adapter
+        params for each timestep.  If 'tasks' is of rank 1, we assume it to be
+        of shape [batch], indicating a single task for all timesteps of a
+        sequence.  This latter setup uses substantially less memory and is
+        generally preferred.
+
+    Returns:
+      A tensor containing the adapted activations with shape
+      [time, batch, input_dim].
+    """
+    p = self.params
+    inputs_shape = tf.shape(inputs)
+    inputs = py_utils.with_dependencies(
+        [
+            # Checks that inputs has 3 dimensions, last is hidden dim.
+            py_utils.assert_shape_match(inputs_shape, [-1, -1, p.input_dim]),
+            # Checks that inputs and tasks have same batch dimension.
+            py_utils.assert_shape_match([inputs_shape[1]],
+                                        [tf.shape(tasks)[-1]])
+        ],
+        inputs)
+
+    # To support different task for each timetstep, flatten inputs and
+    # tasks.  Below, 'batch' now refers to flattened batch size, time * batch.
+    per_timestep_task = (tasks.shape.ndims == 2)
+    if per_timestep_task:
+      tasks = py_utils.with_dependencies(
+          [
+              # Checks that inputs and tasks have same time dimension.
+              py_utils.assert_shape_match(inputs_shape[:1],
+                                          tf.shape(tasks)[:1])
+          ],
+          tasks)
+      tasks = tf.reshape(tasks, [-1])
+      inputs = tf.reshape(inputs, [1, -1, p.input_dim])
+
+    # Lookup all weights and biases
+    # [batch] -> [batch, hidden * k] -> [batch, hidden, k]
+    down_weights = tf.reshape(
+        self.down_proj_w.EmbLookup(theta.down_proj_w, tasks),
+        [-1, p.input_dim, p.bottleneck_dim])
+    # [batch] -> [batch, k] -> [1, batch, k]
+    down_biases = tf.expand_dims(
+        self.down_proj_b.EmbLookup(theta.down_proj_b, tasks), 0)
+    # [batch] -> [batch, k * hidden] -> [batch, k, hidden]
+    up_weights = tf.reshape(
+        self.up_proj_w.EmbLookup(theta.up_proj_w, tasks),
+        [-1, p.bottleneck_dim, p.input_dim])
+    # [batch] -> [batch, h] -> [1, batch, h]
+    up_biases = tf.expand_dims(
+        self.up_proj_b.EmbLookup(theta.up_proj_b, tasks), 0)
+
+    # Layer norm -> down-projection -> non-linearity -> up-projection
+    norm_inputs = self.layer_norm.FProp(theta.layer_norm, inputs)
+    # If per_timestep_task, t = 1, b = time * batch.
+    # Otherwise, t = time, b = batch.
+    down_projected = tf.einsum('tbh,bhk->tbk', norm_inputs, down_weights)
+    down_projected += down_biases
+    down_projected = tf.nn.relu(down_projected)
+    up_projected = tf.einsum('tbk,bkh->tbh', down_projected, up_weights)
+    up_projected += up_biases
+    output = inputs + up_projected
+
+    # Unflatten output: [1, time * batch, hidden] -> [time, batch, hidden]
+    if per_timestep_task:
+      output = tf.reshape(output, inputs_shape)
+
+    return output
+
+
+class CCTGatingNetwork(quant_utils.QuantizableLayer):
+  """A gating network that is continous for training and discrete for eval.
+
+  Based on the gating network from https://arxiv.org/abs/2002.07106.
+  """
+
+  @classmethod
+  def Params(cls):
+    p = super(CCTGatingNetwork, cls).Params()
+    p.Define('input_dim', 0, 'Depth of the input to the network.')
+    p.Define('hidden_layer_dim', 0, 'Depth of the hidden layer outputs.')
+    p.Define('num_outputs', 0, 'Number of scalar gate outputs.')
+    p.Define('noise_std', 1.0, 'Standard deviation for gating noise.')
+    p.Define('noise_warmup_steps', 1.0, 'Steps to full noise.')
+    return p
+
+  @base_layer.initializer
+  def __init__(self, params):
+    super(CCTGatingNetwork, self).__init__(params)
+    p = self.params
+    with tf.variable_scope(p.name):
+      params = schedule.PolynomialSchedule.Params()
+      params.start = (0, 0.0)
+      params.limit = (p.noise_warmup_steps, p.noise_std)
+      self.CreateChild('noise_std', params)
+
+      params = FeedForwardNet.Params()
+      params.name = 'gating_layer'
+      params.input_dim = p.input_dim
+      params.activation = ['RELU', 'NONE']
+      params.hidden_layer_dims = [p.hidden_layer_dim, p.num_outputs]
+      self.CreateChild('gatingfflayer', params)
+
+  def FProp(self, theta, inputs, paddings=None):
+    p = self.params
+    p_c = self.gatingfflayer.FProp(theta.gatingfflayer, inputs, paddings)
+    if p.is_inference:
+      ones = tf.ones(tf.shape(p_c), py_utils.FPropDtype(p))
+      zeros = tf.zeros(tf.shape(p_c), py_utils.FPropDtype(p))
+      p_c = tf.where(
+          tf.greater_equal(p_c, tf.constant(0.0, dtype=py_utils.FPropDtype(p))),
+          ones, zeros)
+    else:
+      noise_std = self.noise_std.FProp(theta.noise_std, theta.global_step)
+      noise = py_utils.DeterministicVN(
+          p,
+          py_utils.GenerateStepSeedPair(p, theta.global_step),
+          tf.shape(p_c),
+          std=noise_std)
+      p_c = tf.nn.sigmoid(p_c + noise)
+    return p_c
+
+  @classmethod
+  def FPropMeta(cls, p, inputs, paddings=None):
+    py_utils.CheckShapes((inputs,))
+    assert inputs[-1] == p.input_dim
+    flops = 0
+    in_dim = inputs[-1]
+    other_dims = inputs.num_elements() / in_dim
+    flops = 5 * other_dims * in_dim * p.hidden_layer_dim
+    flops = 5 * other_dims * p.num_outputs * p.hidden_layer_dim
+    out_shape = tshape.Shape(inputs[:-1] + [symbolic.ToStatic(p.num_outputs)])
+    return py_utils.NestedMap(flops=flops, out_shapes=(out_shape,))

@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,19 +15,17 @@
 # ==============================================================================
 """Tests for inference_graph_exporter."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
 
 from lingvo import model_registry
+import lingvo.compat as tf
 from lingvo.core import base_input_generator
 from lingvo.core import base_model
 from lingvo.core import base_model_params
 from lingvo.core import inference_graph_exporter
 from lingvo.core import inference_graph_pb2
+from lingvo.core import predictor
 from lingvo.core import py_utils
+from lingvo.core import test_utils
 
 
 class DummyLegacyModel(base_model.BaseTask):
@@ -37,6 +36,8 @@ class DummyLegacyModel(base_model.BaseTask):
     return p
 
   def Inference(self):
+    if py_utils.use_tpu():
+      raise NotImplementedError('TPU is not supported.')
     with tf.name_scope('inference'):
       feed1 = tf.placeholder(name='feed1_node', dtype=tf.float32, shape=[1])
       fetch1 = tf.identity(feed1, name='fetch1_node')
@@ -105,7 +106,7 @@ class DummyModelParams(base_model_params.SingleTaskModelParams):
     return p
 
 
-class InferenceGraphExporterTest(tf.test.TestCase):
+class InferenceGraphExporterTest(test_utils.TestCase):
 
   def testExportModelParamsWithSubgraphDict(self):
     params = model_registry.GetParams('test.DummyLegacyModelParams', 'Test')
@@ -138,8 +139,23 @@ class InferenceGraphExporterTest(tf.test.TestCase):
     self.assertEqual(subgraph.fetches['fetch1'], 'inference/fetch1_node:0')
     self.assertEqual(subgraph.fetches['fetch_op'], 'inference/fetch1_node')
 
+  def testExportModelDoesNotAffectFlagsOnException(self):
+    initial_flags = {k: tf.flags.FLAGS[k].value for k in tf.flags.FLAGS}
+    params = model_registry.GetParams('test.DummyLegacyModelParams', 'Test')
+    with self.assertRaises(NotImplementedError):
+      inference_graph_exporter.InferenceGraphExporter.Export(
+          params,
+          device_options=inference_graph_exporter.InferenceDeviceOptions(
+              device='tpu',
+              retain_device_placement=False,
+              var_options=None,
+              gen_init_op=True,
+              dtype_override=None))
+    self.assertDictEqual(initial_flags,
+                         {k: tf.flags.FLAGS[k].value for k in tf.flags.FLAGS})
 
-class NoConstGuaranteeScopeTest(tf.test.TestCase):
+
+class NoConstGuaranteeScopeTest(test_utils.TestCase):
 
   def testNoConsting(self):
     with inference_graph_exporter.ConstGuaranteeScope():
@@ -183,7 +199,10 @@ class LinearModel(base_model.BaseTask):
     """Computes y = w^T x + b. Returns y and x, as outputs and inputs."""
     with tf.variable_scope('inference'):
       x = tf.placeholder(dtype=tf.float32, name='input')
-      y = tf.reduce_sum(self._w * x) + self._b
+      r = tf.random.stateless_uniform([3],
+                                      seed=py_utils.GenerateStepSeedPair(
+                                          self.params, self.theta.global_step))
+      y = tf.reduce_sum((self._w + r) * x) + self._b
       return {'default': ({'output': y}, {'input': x})}
 
 
@@ -198,7 +217,7 @@ class LinearModelTpu(LinearModel):
       def InferenceFn(x):
         return tf.reduce_sum(self._w * x) + self._b
 
-      y = tf.contrib.tpu.rewrite(InferenceFn, [x])
+      y = tf.tpu.rewrite(InferenceFn, [x])
       return {'tpu': ({'output': y[0]}, {'input': x})}
 
 
@@ -251,7 +270,7 @@ class LinearModelTpuParamsWithEma(base_model_params.SingleTaskModelParams):
     return p
 
 
-class InferenceGraphExporterLinearModelTest(tf.test.TestCase):
+class InferenceGraphExporterLinearModelTest(test_utils.TestCase):
 
   def testExport(self):
     """Test basic export."""
@@ -298,6 +317,141 @@ class InferenceGraphExporterLinearModelTest(tf.test.TestCase):
             gen_init_op=True,
             dtype_override=tf.bfloat16))
     self.assertIn('tpu', inference_graph.subgraphs)
+
+  def testExportWithRandomSeeds(self):
+    """Test the effect of setting random seeds on export."""
+    params = model_registry.GetParams('test.LinearModelParams', 'Test')
+    # Default -- use random_seed = None.
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params, subgraph_filter=['default'])
+    pred = predictor.Predictor(inference_graph)
+    [no_op_seed_1] = pred.Run(['output'], input=3)
+    [no_op_seed_2] = pred.Run(['output'], input=3)
+    self.assertNotEqual(no_op_seed_1, no_op_seed_2)
+    pred = predictor.Predictor(inference_graph)
+    [no_op_seed_3] = pred.Run(['output'], input=3)
+    self.assertNotEqual(no_op_seed_1, no_op_seed_3)
+
+    # Use a fixed random_seed.
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params, subgraph_filter=['default'], random_seed=1234)
+    pred = predictor.Predictor(inference_graph)
+    [fixed_op_seed_1] = pred.Run(['output'], input=3)
+    [fixed_op_seed_2] = pred.Run(['output'], input=3)
+    self.assertEqual(fixed_op_seed_1, fixed_op_seed_2)
+    pred = predictor.Predictor(inference_graph)
+    [fixed_op_seed_3] = pred.Run(['output'], input=3)
+    self.assertEqual(fixed_op_seed_1, fixed_op_seed_3)
+
+    # A different seed gives different results.
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params, subgraph_filter=['default'], random_seed=1235)
+    pred = predictor.Predictor(inference_graph)
+    [fixed_op_seed_4] = pred.Run(['output'], input=3)
+    self.assertNotEqual(fixed_op_seed_1, fixed_op_seed_4)
+
+
+class GetOutputNamesTest(test_utils.TestCase):
+
+  def _TestGraph(self):
+    params = model_registry.GetParams('test.LinearModelParams', 'Test')
+    inference_graph = inference_graph_exporter.InferenceGraphExporter.Export(
+        params)
+    graph = tf.Graph()
+    with graph.as_default():
+      tf.import_graph_def(inference_graph.graph_def, name='')
+    return graph, inference_graph
+
+  def testDefault(self):
+    graph, inference_graph = self._TestGraph()
+    output_op_names = inference_graph_exporter.GetOutputOpNames(
+        graph, inference_graph)
+    self.assertEqual(output_op_names, [
+        # pyformat: disable
+        'inference/add_2',
+        'inference/input',
+        'testing/b/var',
+        'testing/b/var/Initializer/random_normal',
+        'testing/b/var/Initializer/random_normal/RandomStandardNormal',
+        'testing/b/var/Initializer/random_normal/mean',
+        'testing/b/var/Initializer/random_normal/mul',
+        'testing/b/var/Initializer/random_normal/shape',
+        'testing/b/var/Initializer/random_normal/stddev',
+        'testing/w/var',
+        'testing/w/var/Initializer/random_normal',
+        'testing/w/var/Initializer/random_normal/RandomStandardNormal',
+        'testing/w/var/Initializer/random_normal/mean',
+        'testing/w/var/Initializer/random_normal/mul',
+        'testing/w/var/Initializer/random_normal/shape',
+        'testing/w/var/Initializer/random_normal/stddev',
+        # pyformat: enable
+    ])
+
+  def testNoPreserveColocationNodes(self):
+    graph, inference_graph = self._TestGraph()
+    output_op_names = inference_graph_exporter.GetOutputOpNames(
+        graph, inference_graph, preserve_colocation_nodes=False)
+    self.assertEqual(output_op_names, [
+        # pyformat: disable
+        'inference/add_2',
+        'inference/input',
+        # pyformat: enable
+    ])
+
+  def testPreserveSaverRestoreNodes(self):
+    graph, inference_graph = self._TestGraph()
+    output_op_names = inference_graph_exporter.GetOutputOpNames(
+        graph,
+        inference_graph,
+        preserve_colocation_nodes=False,
+        preserve_saver_restore_nodes=True)
+    self.assertEqual(output_op_names, [
+        # pyformat: disable
+        'inference/add_2',
+        'inference/input',
+        'save/Const',
+        'save/restore_all',
+        # pyformat: enable
+    ])
+
+  def testPreserveExtraOps(self):
+    graph, inference_graph = self._TestGraph()
+    output_op_names = inference_graph_exporter.GetOutputOpNames(
+        graph,
+        inference_graph,
+        preserve_colocation_nodes=False,
+        preserve_extra_ops=[
+            'init_all_tables', 'init_all_variables', 'tpu_init_op'
+        ])
+    self.assertEqual(output_op_names, [
+        # pyformat: disable
+        'inference/add_2',
+        'inference/input',
+        'init_all_tables',
+        'init_all_variables',
+        # pyformat: enable
+    ])
+
+  def testPreserveSaverNodesAndExtraOps(self):
+    graph, inference_graph = self._TestGraph()
+    output_op_names = inference_graph_exporter.GetOutputOpNames(
+        graph,
+        inference_graph,
+        preserve_colocation_nodes=False,
+        preserve_saver_restore_nodes=True,
+        preserve_extra_ops=[
+            'init_all_tables', 'init_all_variables', 'tpu_init_op'
+        ])
+    self.assertEqual(output_op_names, [
+        # pyformat: disable
+        'inference/add_2',
+        'inference/input',
+        'init_all_tables',
+        'init_all_variables',
+        'save/Const',
+        'save/restore_all',
+        # pyformat: enable
+    ])
 
 
 if __name__ == '__main__':

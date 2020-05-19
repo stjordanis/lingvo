@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,18 +19,17 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
-from six.moves import range
-from six.moves import zip
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import base_model
 from lingvo.core import layers
-from lingvo.core import lr_schedule
 from lingvo.core import metrics
 from lingvo.core import plot
 from lingvo.core import py_utils
+from lingvo.core import schedule
+import numpy as np
+from six.moves import range
+from six.moves import zip
 
 
 class BaseClassifier(base_model.BaseTask):
@@ -43,28 +43,28 @@ class BaseClassifier(base_model.BaseTask):
 
   def _AddSummary(self, batch, prediction):
     """Adds image summaries for the batch."""
-    if self.params.is_eval:
+    if not self.do_eval:
       # Image summaries only works in evaler/decoder.
-      fig = plot.MatplotlibFigureSummary(
-          'examples', figsize=(1, 1), max_outputs=10)
+      return
 
-      def Draw(fig, axes, img, label, pred):
-        plot.AddImage(
-            fig=fig,
-            axes=axes,
-            data=img[:, :, 0] / 256.,
-            show_colorbar=False,
-            suppress_xticks=True,
-            suppress_yticks=True)
-        axes.text(
-            x=0.5,
-            y=0,
-            s=u'%d vs. %d' % (label, pred),
-            transform=axes.transAxes,
-            horizontalalignment='center')
+    def Draw(fig, axes, img, label, pred):
+      plot.AddImage(
+          fig=fig,
+          axes=axes,
+          data=img[:, :, 0] / 256.,
+          show_colorbar=False,
+          suppress_xticks=True,
+          suppress_yticks=True)
+      axes.text(
+          x=0.5,
+          y=0,
+          s=u'%d vs. %d' % (label, pred),
+          transform=axes.transAxes,
+          horizontalalignment='center')
 
+    with plot.MatplotlibFigureSummary(
+        'examples', figsize=(1, 1), max_outputs=10) as fig:
       fig.AddSubplot([batch.raw, batch.label, prediction], Draw)
-      fig.Finalize()
 
   def _Accuracy(self, k, logits, labels, weights):
     """Compute top-k accuracy.
@@ -82,10 +82,9 @@ class BaseClassifier(base_model.BaseTask):
     n, c = tf.unstack(tf.shape(logits), 2)
     labels = py_utils.HasShape(labels, [n])
     weights = py_utils.HasShape(weights, [n])
-    correct = tf.nn.in_top_k(logits, labels, k)
-    return tf.reduce_sum(
-        tf.cast(correct, weights.dtype) * weights) / tf.maximum(
-            1e-8, tf.reduce_sum(weights))
+    correct = tf.nn.in_top_k(targets=labels, predictions=logits, k=k)
+    return tf.reduce_sum(tf.cast(correct, weights.dtype) *
+                         weights) / tf.maximum(1e-8, tf.reduce_sum(weights))
 
 
 class ModelV1(BaseClassifier):
@@ -109,9 +108,8 @@ class ModelV1(BaseClassifier):
     tp = p.train
     tp.learning_rate = 1e-4  # Adam base LR.
     tp.lr_schedule = (
-        lr_schedule.LinearRampupExponentialDecayScaledByNumSplitSchedule
-        .Params().Set(
-            warmup=100, decay_start=100000, decay_end=1000000, min=0.1))
+        schedule.LinearRampupExponentialDecayScaledByNumSplitSchedule.Params()
+        .Set(warmup=100, decay_start=100000, decay_end=1000000, min=0.1))
     return p
 
   @base_layer.initializer
@@ -124,11 +122,11 @@ class ModelV1(BaseClassifier):
       assert len(p.filter_shapes) == len(p.window_shapes)
 
       # A few conv + max pooling layers.
-      shape = tf.TensorShape([None] + list(p.input.data_shape))
+      shape = [None] + list(p.input.data_shape)
       conv_params = []
       pooling_params = []
-      for i, (kernel, window) in enumerate(
-          zip(p.filter_shapes, p.window_shapes)):
+      for i, (kernel,
+              window) in enumerate(zip(p.filter_shapes, p.window_shapes)):
         conv_params.append(layers.ConvLayer.Params().Set(
             name='conv%d' % i,
             filter_shape=kernel,
@@ -167,14 +165,13 @@ class ModelV1(BaseClassifier):
       # MaxPool
       act, _ = self.pool[i].FProp(theta.pool[i], act)
       # Dropout (optional)
-      if p.dropout_prob > 0.0 and not p.is_eval:
-        act = tf.nn.dropout(
-            act, keep_prob=1.0 - p.dropout_prob, seed=p.random_seed)
+      if p.dropout_prob > 0.0 and not self.do_eval:
+        act = tf.nn.dropout(act, rate=p.dropout_prob, seed=p.random_seed)
     # FC
     act = self.fc.FProp(theta.fc, tf.reshape(act, [batch, -1]))
 
     # Softmax
-    labels = tf.to_int64(input_batch.label)
+    labels = tf.cast(input_batch.label, tf.int64)
     xent = self.softmax.FProp(
         theta=theta.softmax,
         inputs=act,
@@ -188,14 +185,17 @@ class ModelV1(BaseClassifier):
         'log_pplx': (xent.avg_xent, batch),
         'num_preds': (batch, 1),
     }
-    if p.is_eval:
+    if self.do_eval:
       acc1 = self._Accuracy(1, xent.logits, labels, input_batch.weight)
       acc5 = self._Accuracy(5, xent.logits, labels, input_batch.weight)
-      rets.update(accuracy=(acc1, batch), acc5=(acc5, batch))
-    return rets, {}
+      rets.update(
+          accuracy=(acc1, batch),
+          acc5=(acc5, batch),
+          error=(1. - acc1, batch),
+          error5=(1. - acc5, batch))
+    return rets, {'loss': xent.per_example_xent}
 
   def Decode(self, input_batch):
-    p = self.params
     with tf.name_scope('decode'):
       return self.FPropDefaultTheta(input_batch)[0]
 
@@ -216,6 +216,9 @@ class ModelV2(BaseClassifier):
   def Params(cls):
     p = super(ModelV2, cls).Params()
     p.Define('extract', None, 'Param for the layer to extract image features.')
+    p.Define('label_smoothing', 0., 'Smooth the labels towards 1/num_classes.')
+    p.Define('compute_accuracy_for_training', False,
+             'Whether to compute accuracy for training.')
     return p
 
   @base_layer.initializer
@@ -228,24 +231,33 @@ class ModelV2(BaseClassifier):
       self.CreateChild('extract', p.extract)
       self.CreateChild('softmax', p.softmax)
 
-  def FPropTower(self, theta, input_batch):
-    p = self.params
-    batch = tf.shape(input_batch.data)[0]
-
+  def ComputePredictions(self, theta, input_batch):
     # Forward through layers.
     act = self.extract.FProp(theta.extract, input_batch.data)
+    # Avg pool
+    act = tf.reduce_mean(act, axis=[1, 2])
+    logits = self.softmax.Logits(theta.softmax, act)
+    return py_utils.NestedMap(act=act, logits=logits)
 
-    with tf.colocate_with(act):
-      # Avg pool
-      act = tf.reduce_mean(act, axis=[1, 2])
+  def ComputeLoss(self, theta, predictions, input_batch):
+    p = self.params
+    batch = tf.shape(input_batch.data)[0]
+    act = predictions.act
+    with tf.ops.colocate_with(act):
       tf.logging.info("{}'s device: {}".format(act, act.device))
       # Softmax
-      labels = tf.to_int64(input_batch.label)
+      labels = tf.cast(input_batch.label, tf.int64)
+      onehot_labels = tf.one_hot(labels, p.softmax.num_classes)
+      if p.label_smoothing > 0:
+        smooth_positives = 1.0 - p.label_smoothing
+        smooth_negatives = p.label_smoothing / p.softmax.num_classes
+        onehot_labels = onehot_labels * smooth_positives + smooth_negatives
+
       xent = self.softmax.FProp(
           theta=theta.softmax,
           inputs=act,
           class_weights=input_batch.weight,
-          class_ids=labels)
+          class_probabilities=onehot_labels)
 
     self._AddSummary(input_batch, xent.per_example_argmax)
 
@@ -254,8 +266,53 @@ class ModelV2(BaseClassifier):
         'log_pplx': (xent.avg_xent, batch),
         'num_preds': (batch, 1),
     }
-    if p.is_eval:
+    if self.do_eval or p.compute_accuracy_for_training:
       acc1 = self._Accuracy(1, xent.logits, labels, input_batch.weight)
       acc5 = self._Accuracy(5, xent.logits, labels, input_batch.weight)
-      rets.update(accuracy=(acc1, batch), acc5=(acc5, batch))
-    return rets, {}
+      rets.update(
+          accuracy=(acc1, batch),
+          acc5=(acc5, batch),
+          error=(1. - acc1, batch),
+          error5=(1. - acc5, batch))
+    return rets, {'loss': xent.per_example_xent}
+
+  def Inference(self):
+    """Constructs inference subgraphs.
+
+    Returns:
+      dict: A dictionary of the form ``{'subgraph_name': (fetches, feeds)}``.
+      Each of fetches and feeds is itself a dictionary which maps a string name
+      (which describes the tensor) to a corresponding tensor in the inference
+      graph which should be fed/fetched from.
+    """
+    subgraphs = {}
+    with tf.name_scope('inference'):
+      subgraphs['default'] = self._InferenceSubgraph_Default()
+    return subgraphs
+
+  def _InferenceSubgraph_Default(self):
+    """Constructs graph for single-image inference.
+
+    Returns:
+      (fetches, feeds) where both fetches and feeds are dictionaries. Each
+      dictionary consists of keys corresponding to tensor names, and values
+      corresponding to a tensor in the graph which should be input/read from.
+    """
+    p = self.params
+    with tf.name_scope('default'):
+      normalized_image = tf.placeholder(
+          dtype=p.dtype, shape=p.input.data_shape, name='normalized_image')
+      inputs = py_utils.NestedMap(data=normalized_image[tf.newaxis, ...])
+      logits = tf.reshape(
+          self.ComputePredictions(self.theta, inputs).logits,
+          [p.softmax.num_classes],
+          name='logits')
+      feeds = {
+          'normalized_image': normalized_image,
+      }
+      fetches = {
+          'logits': logits,
+          'probs': tf.nn.softmax(logits, name='probs'),
+          'prediction': tf.argmax(logits, name='prediction'),
+      }
+      return fetches, feeds

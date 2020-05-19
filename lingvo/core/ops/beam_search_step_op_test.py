@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,27 +15,25 @@
 # ==============================================================================
 """Tests for beam_search_op."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
+from lingvo import compat as tf
+from lingvo.core import ops
+from lingvo.core import test_utils
+from lingvo.core.ops import hyps_pb2
 import numpy as np
 from six.moves import zip
-import tensorflow as tf
 
 from google.protobuf import text_format
-from lingvo.core.ops import hyps_pb2
-from lingvo.core.ops import py_x_ops
 
 _MIN_SCORE = -1e36
 
 
-class BeamSearchOpTest(tf.test.TestCase):
+class BeamSearchOpTest(test_utils.TestCase):
 
   def setUp(self):
     super(BeamSearchOpTest, self).setUp()
     np.random.seed(12345)
-    tf.set_random_seed(398849988)
+    tf.random.set_seed(398849988)
 
   def _runBeamSearchOpHelper(self,
                              b_size,
@@ -46,7 +45,8 @@ class BeamSearchOpTest(tf.test.TestCase):
                              atten_probs,
                              beam_size=3.0,
                              ensure_full_beam=False,
-                             force_eos_in_last_step=False):
+                             force_eos_in_last_step=False,
+                             local_eos_threshold=-100.0):
     eos_id = 2
     num_hyps_per_beam = b_size / num_beams
 
@@ -60,7 +60,7 @@ class BeamSearchOpTest(tf.test.TestCase):
 
     for i, prob in enumerate(probs):
       (best_scores, cumulative_scores, scores, hyps, prev_hyps, done_hyps,
-       atten_probs, done) = py_x_ops.beam_search_step(
+       atten_probs, done) = ops.beam_search_step(
            prob,
            init_atten_probs,
            best_scores,
@@ -76,11 +76,12 @@ class BeamSearchOpTest(tf.test.TestCase):
            ensure_full_beam=ensure_full_beam,
            num_hyps_per_beam=num_hyps_per_beam,
            valid_eos_max_logit_delta=0.1,
-           force_eos_in_last_step=force_eos_in_last_step)
+           force_eos_in_last_step=force_eos_in_last_step,
+           local_eos_threshold=local_eos_threshold)
 
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False):
       (best_scores, cumulative_scores, scores, hyps, prev_hyps, done_hyps,
-       atten_probs, done, scores, atten_probs) = sess.run([
+       atten_probs, done, scores, atten_probs) = self.evaluate([
            best_scores, cumulative_scores, scores, hyps, prev_hyps, done_hyps,
            atten_probs, done, scores, atten_probs
        ])
@@ -102,7 +103,8 @@ class BeamSearchOpTest(tf.test.TestCase):
                               hyps_expected,
                               prev_hyps_expected,
                               atten_probs_expected,
-                              force_eos_in_last_step=False):
+                              force_eos_in_last_step=False,
+                              local_eos_threshold=-100.0):
 
     (best_scores, cumulative_scores, scores, hyps, prev_hyps, done_hyps,
      atten_probs, done, scores, atten_probs) = self._runBeamSearchOpHelper(
@@ -113,7 +115,8 @@ class BeamSearchOpTest(tf.test.TestCase):
          probs,
          init_atten_probs,
          atten_probs,
-         force_eos_in_last_step=force_eos_in_last_step)
+         force_eos_in_last_step=force_eos_in_last_step,
+         local_eos_threshold=local_eos_threshold)
 
     tf.logging.info(np.array_repr(best_scores))
     tf.logging.info(np.array_repr(cumulative_scores))
@@ -142,24 +145,29 @@ class BeamSearchOpTest(tf.test.TestCase):
     seq_len = 6
     num_classes = 5
 
-    best_scores_expected = [1.895863, 1.54302]
+    best_scores_expected = [1.769434, 1.640316]
     cum_scores_expected = [
-        1.79580379, 1.95926094, 1.66166079, 1.73289895, 1.63867819, 1.5765177,
-        1.57203436, 1.21810341
+        1.823942, 1.609159, 1.610366, 1.454234, 1.348811, 1.3167, 1.346274,
+        1.045735
     ]
-    scores_expected = [[
-        0.89790189, 0.97963047, 0.7637589, 0.75326848, 0.67413247, 0.18659079,
-        0.32619762, 0.0323503
-    ], [
-        0.89790189, 0.97963047, 0.7637589, 0.75326848, 0.96454573, 0.82324922,
-        0.67413247, 0.46483493
-    ], [0., 0., 0., 0., 0., 0., 0., 0.], [0., 0., 0., 0., 0., 0., 0.,
-                                          0.], [0., 0., 0., 0., 0., 0., 0., 0.],
-                       [0., 0., 0., 0., 0., 0., 0., 0.]]
-    hyps_expected = [[3, 4, 0, 0, 1, 1, 4, 3], [3, 4, 0, 0, 1, 1, 1, 3],
+    scores_expected = [
+        [
+            0.86230338, 0.84442794, 0.45372832, 0.38127339, 0.42067075,
+            0.25818801, 0.38612545, 0.18693292
+        ],
+        [
+            0.96163845, 0.76473117, 0.74806261, 0.60980642, 0.9281404,
+            0.47227204, 0.89254606, 0.20130682
+        ],
+        [0., 0., 0., 0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0., 0., 0., 0.],
+        [0., 0., 0., 0., 0., 0., 0., 0.],
+    ]
+    hyps_expected = [[1, 0, 0, 3, 4, 1, 3, 4], [1, 4, 4, 1, 1, 3, 1, 0],
                      [0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0],
                      [0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0]]
-    prev_hyps_expected = [[0, 1, 0, 1, 0, 1, 0, 1], [0, 1, 0, 1, 4, 3, 0, 3],
+    prev_hyps_expected = [[0, 1, 0, 1, 0, 1, 0, 1], [0, 1, 0, 1, 4, 1, 2, 1],
                           [0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0],
                           [0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0]]
 
@@ -167,68 +175,55 @@ class BeamSearchOpTest(tf.test.TestCase):
     beam_id: 1
     ids: 1
     ids: 2
-      scores: 0.186590790749
-      scores: 0.712740063667
+    scores: 0.25818801
+    scores: 0.65319967
     atten_vecs {
-      prob: 0.689820885658
-      prob: 0.216090679169
-      prob: 0.40637075901
+      prob: 0.38612545
+      prob: 0.42067075
+      prob: 0.84442794
     }
     atten_vecs {
-      prob: 0.824981451035
-      prob: 0.774956822395
-      prob: 0.944657206535
+      prob: 0.45298624
+      prob: 0.53518069
+      prob: 0.57700801
     }
     """
     atten_probs_expected = [
-        [[0.85785675, 0.60858226,
-          0.72539818], [0.68982089, 0.21609068,
-                        0.40637076], [0.85785675, 0.60858226, 0.72539818],
-         [0.68982089, 0.21609068,
-          0.40637076], [0.85785675, 0.60858226,
-                        0.72539818], [0.68982089, 0.21609068, 0.40637076],
-         [0.85785675, 0.60858226,
-          0.72539818], [0.68982089, 0.21609068, 0.40637076]],
-        [[0.85785675, 0.60858226,
-          0.72539818], [0.68982089, 0.21609068, 0.40637076],
-         [0.85785675, 0.60858226,
-          0.72539818], [0.68982089, 0.21609068,
-                        0.40637076], [0.51121557, 0.80525708, 0.73596036], [
-                            0.45252705, 0.37489808, 0.12745726
-                        ], [0.85785675, 0.60858226, 0.72539818],
-         [0.45252705, 0.37489808, 0.12745726]], [
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-         ], [
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-         ], [
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-             [0., 0., 0.],
-         ], [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.],
-             [0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.]]
+        [
+            [0.45372832, 0.86230338, 0.65504861],
+            [0.38612545, 0.42067075, 0.84442794],
+            [0.45372832, 0.86230338, 0.65504861],
+            [0.38612545, 0.42067075, 0.84442794],
+            [0.45372832, 0.86230338, 0.65504861],
+            [0.38612545, 0.42067075, 0.84442794],
+            [0.45372832, 0.86230338, 0.65504861],
+            [0.38612545, 0.42067075, 0.84442794],
+        ],
+        [
+            [0.45372832, 0.86230338, 0.65504861],
+            [0.38612545, 0.42067075, 0.84442794],
+            [0.45372832, 0.86230338, 0.65504861],
+            [0.38612545, 0.42067075, 0.84442794],
+            [0.0532794, 0.53777719, 0.07609642],
+            [0.38612545, 0.42067075, 0.84442794],
+            [0.25818801, 0.03645897, 0.38127339],
+            [0.38612545, 0.42067075, 0.84442794],
+        ],
+        [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.],
+         [0., 0., 0.], [0., 0., 0.], [0., 0., 0.]],
+        [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.],
+         [0., 0., 0.], [0., 0., 0.], [0., 0., 0.]],
+        [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.],
+         [0., 0., 0.], [0., 0., 0.], [0., 0., 0.]],
+        [[0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.], [0., 0., 0.],
+         [0., 0., 0.], [0., 0., 0.], [0., 0., 0.]],
     ]
 
-    scores = [tf.random_uniform([b_size, num_classes])] * 2
-    init_atten_probs = tf.random_uniform([b_size, 3])
+    scores = [
+        tf.random.uniform([b_size, num_classes], seed=12345),
+        tf.random.uniform([b_size, num_classes], seed=12346),
+    ]
+    init_atten_probs = tf.random.uniform([b_size, 3], seed=12345)
     atten_probs = tf.zeros([seq_len, b_size, 3])
     done_hyps = self._testBeamSearchOpHelper(
         b_size, num_beams, seq_len, 0., scores, init_atten_probs, atten_probs,
@@ -310,7 +305,7 @@ class BeamSearchOpTest(tf.test.TestCase):
         prev_hyps_expected=[[0, 0], [1, 0], [0, 0]],
         atten_probs_expected=np.zeros([seq_len, b_size, 0]))
 
-    np.testing.assert_array_equal([['0', '0'], ['0', '0'], ['0', '0']],
+    np.testing.assert_array_equal([[b'0', b'0'], [b'0', b'0'], [b'0', b'0']],
                                   done_hyps)
 
   def test_three_steps_eos(self):
@@ -418,7 +413,7 @@ class BeamSearchOpTest(tf.test.TestCase):
         prev_hyps_expected=prev_hyps_expected,
         atten_probs_expected=np.zeros([seq_len, b_size, 0]),
         force_eos_in_last_step=False)
-    np.testing.assert_array_equal([['0', '0'], ['0', '0'], ['0', '0']],
+    np.testing.assert_array_equal([[b'0', b'0'], [b'0', b'0'], [b'0', b'0']],
                                   done_hyps)
 
     # If force eos is true, we get valid results as in test_three_step_eos,
@@ -474,7 +469,10 @@ class BeamSearchOpTest(tf.test.TestCase):
     self._SameHyp(expected_for_beam_0, done_hyps[2, 0])
     self._SameHyp(expected_for_beam_1, done_hyps[2, 1])
 
-  def _testBeamSearchStoppingHelper(self, beam_size, ensure_full_beam):
+  def _testBeamSearchStoppingHelper(self,
+                                    beam_size,
+                                    ensure_full_beam,
+                                    local_eos_threshold=-100):
     b_size = 2
     num_beams = 1
     seq_len = 3
@@ -492,7 +490,8 @@ class BeamSearchOpTest(tf.test.TestCase):
         init_atten_probs=tf.zeros([b_size, 0]),
         atten_probs=np.zeros([seq_len, b_size, 0]),
         beam_size=beam_size,
-        ensure_full_beam=ensure_full_beam)
+        ensure_full_beam=ensure_full_beam,
+        local_eos_threshold=local_eos_threshold)
     all_done = results[7]
     return all_done
 
@@ -515,6 +514,19 @@ class BeamSearchOpTest(tf.test.TestCase):
     all_done = self._testBeamSearchStoppingHelper(0.1, True)
     self.assertEqual(False, all_done)
 
+  def test_small_eos_threshold(self):
+    # With a small eos_threshold, we are done because the active hyp produced,
+    # </s>, independent of small beam size.
+    all_done = self._testBeamSearchStoppingHelper(0.1, False, -100.0)
+    self.assertTrue(all_done)
+
+  def test_large_eos_threshold(self):
+    # With larger eos_threshold, we are _not_ yet done, because we do not hit
+    # </s> criteria we we require to have two done hyps before stopping,
+    # regardless of beam size.
+    all_done = self._testBeamSearchStoppingHelper(0.1, False, 0.01)
+    self.assertFalse(all_done)
+
   def _SameHyp(self, expected_hyp_str, real_serialized_hyp):
     hyp1 = hyps_pb2.Hypothesis()
     text_format.Merge(expected_hyp_str, hyp1)
@@ -523,20 +535,20 @@ class BeamSearchOpTest(tf.test.TestCase):
 
     self.assertEqual(hyp1.beam_id, hyp2.beam_id)
     self.assertEqual(hyp1.ids, hyp2.ids)
-    self.assertEqual(hyp1.normalized_score, hyp2.normalized_score)
+    self.assertNear(hyp1.normalized_score, hyp2.normalized_score, 1e-6)
     self.assertAllClose(hyp1.scores, hyp2.scores)
     self.assertEqual(len(hyp1.atten_vecs), len(hyp2.atten_vecs))
     for av1, av2 in zip(hyp1.atten_vecs, hyp2.atten_vecs):
       self.assertAllClose(av1.prob, av2.prob)
 
   def testTopKTerminatedHypsOp(self):
-    with self.session(use_gpu=False) as sess:
+    with self.session(use_gpu=False):
       b_size = 8
       num_beams = 2
       num_hyps_per_beam = b_size / num_beams
       seq_len = 6
-      scores = tf.random_uniform([b_size, 5])
-      atten_probs = tf.random_uniform([b_size, 3])
+      scores = tf.random.uniform([b_size, 5], seed=12345)
+      atten_probs = tf.random.uniform([b_size, 3], seed=12345)
       src_seq_lengths = [3, 3]
       best_scores = tf.zeros([num_beams])
       cumulative_scores = tf.zeros([b_size])
@@ -548,7 +560,7 @@ class BeamSearchOpTest(tf.test.TestCase):
 
       (out_best_scores_0, out_cumulative_scores_0, out_scores_0, out_hyps_0,
        out_prev_hyps_0, out_done_hyps_0, out_atten_probs_0,
-       _) = py_x_ops.beam_search_step(
+       _) = ops.beam_search_step(
            scores,
            atten_probs,
            best_scores,
@@ -563,7 +575,7 @@ class BeamSearchOpTest(tf.test.TestCase):
            beam_size=3.0,
            num_hyps_per_beam=num_hyps_per_beam)
 
-      outputs = py_x_ops.beam_search_step(
+      outputs = ops.beam_search_step(
           scores,
           atten_probs,
           out_best_scores_0,
@@ -580,7 +592,7 @@ class BeamSearchOpTest(tf.test.TestCase):
 
       # Get the topk terminated hyps.
       in_done_hyps = outputs[5]
-      topk_hyps = py_x_ops.top_k_terminated_hyps(
+      topk_hyps = ops.top_k_terminated_hyps(
           in_done_hyps,
           src_seq_lengths,
           k=2,
@@ -588,57 +600,57 @@ class BeamSearchOpTest(tf.test.TestCase):
           length_normalization=0.2,
           coverage_penalty=0.2,
           target_seq_length_ratio=1.0)
-      seq_ids, seq_lens, seq_scores = py_x_ops.unpack_hyp(
+      seq_ids, seq_lens, seq_scores = ops.unpack_hyp(
           tf.reshape(topk_hyps, [-1]), max_seq_length=5)
 
-      k1, k2, k3, k4 = sess.run([topk_hyps, seq_ids, seq_lens, seq_scores])
+      k1, k2, k3, k4 = self.evaluate([topk_hyps, seq_ids, seq_lens, seq_scores])
       print(np.array_repr(k1))
       assert k1.size == 4
 
       expected_top1_for_beam_0 = """
       beam_id: 0
-      ids: 3
+      ids: 1
       ids: 2
-      scores: 0.897901892662
-      scores: 0.997961401939
+      scores: 0.86230338
+      scores: 0.65504861
       atten_vecs {
-        prob: 0.857856750488
-        prob: 0.608582258224
-        prob: 0.725398182869
+        prob: 0.45372832
+        prob: 0.86230338
+        prob: 0.65504861
       }
       atten_vecs {
-        prob: 0.857856750488
-        prob: 0.608582258224
-        prob: 0.725398182869
+        prob: 0.45372832
+        prob: 0.86230338
+        prob: 0.65504861
       }
-      normalized_score: 1.35659193993
+      normalized_score: 1.002714
       """
       expected_top2_for_beam_1 = """
       beam_id: 1
-      ids: 0
+      ids: 3
       ids: 2
-      scores: 0.753268480301
-      scores: 0.789751410484
+      scores: 0.38127339
+      scores: 0.57700801
       atten_vecs {
-        prob: 0.689820885658
-        prob: 0.216090679169
-        prob: 0.40637075901
+        prob: 0.38612545
+        prob: 0.42067075
+        prob: 0.84442794
       }
       atten_vecs {
-        prob: 0.452527046204
-        prob: 0.374898076057
-        prob: 0.127457261086
+        prob: 0.18693292
+        prob: 0.17821217
+        prob: 0.66380036
       }
-      normalized_score: 1.02671170235
+      normalized_score: 0.480028
       """
       self._SameHyp(expected_top1_for_beam_0, k1[0, 0])
       self._SameHyp(expected_top2_for_beam_1, k1[1, 1])
 
       self.assertAllClose(
           k2,
-          [[3, 2, 0, 0, 0], [0, 2, 0, 0, 0], [4, 2, 0, 0, 0], [0, 2, 0, 0, 0]])
+          [[1, 2, 0, 0, 0], [4, 2, 0, 0, 0], [4, 2, 0, 0, 0], [3, 2, 0, 0, 0]])
       self.assertAllClose(k3, [2, 2, 2, 2])
-      self.assertAllClose(k4, [1.35659194, 1.02759778, 1.21130753, 1.0267117])
+      self.assertAllClose(k4, [1.002714, 0.684296, 0.522484, 0.480028])
 
 
 if __name__ == '__main__':

@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,9 +22,14 @@ from __future__ import print_function
 import inspect
 import re
 
+import lingvo.compat as tf
+from lingvo.core import cluster_factory
+from lingvo.core import py_utils
 import numpy as np
 from six.moves import range
-import tensorflow as tf
+
+# Disable eager execution for all tests.
+tf.disable_eager_execution()
 
 tf.flags.DEFINE_boolean(
     'update_goldens', False,
@@ -32,12 +38,33 @@ tf.flags.DEFINE_boolean(
 FLAGS = tf.flags.FLAGS
 
 
+class TestCase(tf.test.TestCase):
+  """TestCase that performs Lingvo-specific setup."""
+
+  def setUp(self):
+    super(TestCase, self).setUp()
+    # Ensure the global_step variable is created in the default graph.
+    py_utils.GetOrCreateGlobalStepVar()
+
+  def _create_session(self, *args, **kwargs):
+    sess = super(TestCase, self)._create_session(*args, **kwargs)
+    with sess.graph.as_default():
+      # Ensure the global_step variable is created in every new session.
+      py_utils.GetOrCreateGlobalStepVar()
+    return sess
+
+  def SetEval(self, mode):
+    return cluster_factory.SetEval(mode=mode)
+
+
 def _ReplaceOneLineInFile(fpath, linenum, old, new):
+  """Replaces a line for the input file."""
   lines = []
   lines = open(fpath).readlines()
   assert lines[linenum] == old, (
       'Expected "%s" at line %d in file %s, but got "%s"' %
       (lines[linenum], linenum + 1, fpath, old))
+  tf.logging.info('Replacing {}:{}.'.format(fpath, linenum))
   lines[linenum] = new
   with open(fpath, 'w') as f:
     for l in lines:
@@ -73,6 +100,28 @@ def ReplaceGoldenStackAnalysis(new_float_value):
 
 
 def CompareToGoldenSingleFloat(testobj, v1, v2, *args, **kwargs):
+  """Compare golden value with real value.
+
+  When running the bazel tests with FLAGS.update_goldens to be True, this
+  function automatically updates the golden value in the test file if there is a
+  mismatch and the calling site of CompareToGoldenSingleFloat is a 1-liner. E.g.
+  Code::
+
+    test_utils.CompareToGoldenSingleFloat(self, 0.3232, input_batch.label)
+
+  works but this will not::
+
+    test_utils.CompareToGoldenSingleFloat(self,
+                                          0.3232,
+                                          input_batch.label)
+
+  Args:
+    testobj: A test object, such as tf.test.TestCase or test_utils.TestCase.
+    v1: the golden value to compare against.
+    v2: the returned value.
+    *args: extra args
+    **kwargs: extra args
+  """
   if not FLAGS.update_goldens:
     testobj.assertAllClose(v1, v2, *args, **kwargs)
   else:
@@ -84,7 +133,11 @@ def PickEveryN(np_arr, step=1):
   return np_arr.flatten()[::step]
 
 
-def ComputeNumericGradient(sess, y, x, delta=1e-4, step=1,
+def ComputeNumericGradient(sess,
+                           y,
+                           x,
+                           delta=1e-4,
+                           step=1,
                            extra_feed_dict=None):
   """Compute the numeric gradient of y wrt to x.
 
@@ -93,8 +146,8 @@ def ComputeNumericGradient(sess, y, x, delta=1e-4, step=1,
     y: A scalar TF Tensor in the graph constructed in sess.
     x: A TF Tensor in the graph constructed in sess.
     delta: Gradient checker's small perturbation of x[i].
-    step: Only compute numerical gradients for a subset of x values.
-      I.e. dy/dx[i] is computed if i % step == 0.
+    step: Only compute numerical gradients for a subset of x values. I.e.
+      dy/dx[i] is computed if i % step == 0.
     extra_feed_dict: Additional feed_dict of tensors to keep fixed during the
       gradient checking.
 
@@ -110,22 +163,40 @@ def ComputeNumericGradient(sess, y, x, delta=1e-4, step=1,
 
   numeric_grad = np.zeros(x_size, dtype=x_data.dtype)
 
+  # For variables we need to issue an assignment operation in order to update
+  # the value of the variable. This is because with resource variables x will be
+  # pointing to the handle rather than its value.
+  feed_dict = extra_feed_dict or {}
+  ph = tf.placeholder(x_data.dtype, x_shape)
+  x_assign = x.assign(ph) if isinstance(x, tf.Variable) else None
+
   for i in range(0, x_size, step):
     x_pos = x_data.copy()
     if x_size == 1:
       x_pos += delta
     else:
       x_pos.flat[i] += delta
-    y_pos_feed_dict = extra_feed_dict or {}
-    y_pos_feed_dict.update(dict([(x.name, x_pos)]))
-    y_pos = sess.run(y, feed_dict=y_pos_feed_dict)
+    if x_assign is None:
+      feed_dict.update(dict([(x, x_pos)]))
+    else:
+      sess.run(x_assign, feed_dict={ph: x_pos})
+    y_pos = sess.run(y, feed_dict=feed_dict)
+
     x_neg = x_data.copy()
     if x_size == 1:
       x_neg -= delta
     else:
       x_neg.flat[i] -= delta
-    y_neg_feed_dict = extra_feed_dict or {}
-    y_neg_feed_dict.update(dict([(x.name, x_neg)]))
-    y_neg = sess.run(y, feed_dict=y_neg_feed_dict)
+    if x_assign is None:
+      feed_dict.update(dict([(x, x_neg)]))
+    else:
+      sess.run(x_assign, feed_dict={ph: x_neg})
+    y_neg = sess.run(y, feed_dict=feed_dict)
     numeric_grad[i] = (y_pos - y_neg) / (2 * delta)
+
+  # Restore the variable back to its original value to avoid breaking any
+  # further test code that operates on the graph.
+  if x_assign is not None:
+    sess.run(x_assign, feed_dict={ph: x_data})
+
   return numeric_grad.reshape(x_shape)

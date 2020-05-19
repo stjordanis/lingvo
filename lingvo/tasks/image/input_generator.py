@@ -20,13 +20,10 @@ from __future__ import print_function
 
 import os
 import tempfile
-import tensorflow as tf
+import lingvo.compat as tf
+from lingvo.core import base_input_generator
 
 from tensorflow.python.ops import io_ops
-from lingvo.core import base_input_generator
-from lingvo.core import cluster_factory
-from lingvo.core import py_utils
-from lingvo.core.ops import py_x_ops
 
 
 class _MnistInputBase(base_input_generator.BaseTinyDatasetInput):
@@ -42,8 +39,9 @@ class _MnistInputBase(base_input_generator.BaseTinyDatasetInput):
     return p
 
   def _Preprocess(self, raw):
-    data = tf.stack(
-        [tf.image.per_image_standardization(img) for img in tf.unstack(raw)])
+    data = tf.stack([
+        tf.image.per_image_standardization(img) for img in tf.unstack(raw)
+    ])
     data.set_shape(raw.shape)
     return data
 

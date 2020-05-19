@@ -8,53 +8,58 @@ licenses(["notice"])  # Apache 2.0
 py_library(
     name = "classifier",
     srcs = ["classifier.py"],
+    srcs_version = "PY2AND3",
     deps = [
-        # Implicit numpy dependency.
-        # Implicit six dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:base_layer",
         "//lingvo/core:base_model",
         "//lingvo/core:layers",
-        "//lingvo/core:lr_schedule",
         "//lingvo/core:metrics",
         "//lingvo/core:plot",
         "//lingvo/core:py_utils",
+        "//lingvo/core:schedule",
+        # Implicit numpy dependency.
+        # Implicit six dependency.
     ],
 )
 
 py_test(
     name = "classifier_test",
     srcs = ["classifier_test.py"],
+    python_version = "PY3",
     deps = [
         ":classifier",
         ":input_generator",
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo:model_registry",
         "//lingvo/core:cluster_factory",
+        "//lingvo/core:layers",
         "//lingvo/core:py_utils",
         "//lingvo/core:test_utils",
         "//lingvo/tasks/image/params:mnist",
+        # Implicit numpy dependency.
     ],
 )
 
 py_library(
     name = "input_generator",
     srcs = ["input_generator.py"],
+    srcs_version = "PY2AND3",
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:base_input_generator",
-        "//lingvo/core:py_utils",
-        "//lingvo/core/ops:py_x_ops",
     ],
 )
 
 py_test(
     name = "input_generator_test",
     srcs = ["input_generator_test.py"],
+    python_version = "PY3",
     deps = [
         ":input_generator",
+        "//lingvo:compat",
+        "//lingvo/core:test_utils",
         # Implicit numpy dependency.
         # Implicit six dependency.
-        # Implicit tensorflow dependency.
     ],
 )

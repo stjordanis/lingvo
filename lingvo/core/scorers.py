@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,14 +25,8 @@ import six
 from six.moves import range
 
 
-def _IsUnicode(s):
-  return isinstance(s, six.text_type)
-
-
 def _ToUnicode(line):
-  if not _IsUnicode(line):
-    return line.decode('utf-8')
-  return line
+  return six.ensure_text(line, 'utf-8')
 
 
 def _Tokenize(string):

@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,12 +19,23 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from six.moves import zip
-
-import tensorflow as tf
-
+import lingvo.compat as tf
+from lingvo.core import plot
 from lingvo.core import py_utils
 from lingvo.core import scorers
+import numpy as np
+from six.moves import range
+from six.moves import zip
+try:
+  import sklearn.metrics  # pylint: disable=g-import-not-at-top
+  HAS_SKLEARN = True
+except ImportError:
+  HAS_SKLEARN = False
+try:
+  import scipy.stats  # pylint: disable=g-import-not-at-top
+  HAS_SCIPY_STATS = True
+except ImportError:
+  HAS_SCIPY_STATS = False
 
 
 def CreateScalarSummary(name, simple_value):
@@ -88,7 +100,8 @@ class AverageMetric(BaseMetric):
 
   @property
   def value(self):
-    return self._total_value/self._total_weight if self._total_weight > 0 else 0
+    return (self._total_value /
+            self._total_weight if self._total_weight > 0 else 0)
 
 
 class F1Metric(BaseMetric):
@@ -165,11 +178,11 @@ class TpuEvalMetrics(object):
 
   def __init__(self):
     self._metrics = None
-    self._max_metrics = 51
+    self._max_metrics = 100
 
     # Loop-carried values alternate value and weight; all values are scalars.
-    self._initial_values = (
-        2 * self._max_metrics) * [tf.constant(0, tf.float32)]
+    self._initial_values = (2 *
+                            self._max_metrics) * [tf.constant(0, tf.float32)]
 
   def SetMetrics(self, metric_dict, step_args):
     """Sets the metrics to evaluate and the per-step output tensors.
@@ -189,20 +202,20 @@ class TpuEvalMetrics(object):
       loop).
     """
     num_metrics = len(metric_dict)
-    assert num_metrics <= self._max_metrics, (
-        'Increase _max_metrics to >= %d' % num_metrics)
-    self._metrics = py_utils.NestedMap(metric_dict)
+    assert num_metrics <= self._max_metrics, ('Increase _max_metrics to >= %d' %
+                                              num_metrics)
+    self._metrics = metric_dict
 
     # self._metrics contains a map of (metric_value,
     # metric_weight). We convert it into [metric_value *
     # metric_weight, metric_weight] to make it easier to aggregate
     # metric values across steps and TPU replicas.
     ret = []
-    for (value, weight) in self._metrics.Flatten():
+    for _, (value, weight) in sorted(self._metrics.items()):
       assert value.shape.is_fully_defined(), ('%s' % value)
       assert weight.shape.is_fully_defined(), ('%s' % weight)
-      weight = tf.to_float(weight)
-      value = tf.to_float(value) * weight
+      weight = tf.cast(weight, tf.float32)
+      value = tf.cast(value, tf.float32) * weight
       ret += [value, weight]
     # Each metric has two tensors: value and weight.
     assert len(ret) == 2 * num_metrics
@@ -235,9 +248,9 @@ class TpuEvalMetrics(object):
       The tensors of the final avg values and total weights.
     """
     # Each metric has two tensors in the loop carrying result.
-    metrics = loop_result[:2 * len(self._metrics.Flatten())]
+    metrics = loop_result[:2 * len(self._metrics.items())]
     # Aggregate across tpu replicas.
-    metrics = [tf.contrib.tpu.cross_replica_sum(x) for x in metrics]
+    metrics = [tf.tpu.cross_replica_sum(x) for x in metrics]
     ret = []
     for (value, weight) in self._Zip(metrics):
       value, weight = py_utils.WeightedAvg(value / weight, weight)
@@ -245,5 +258,134 @@ class TpuEvalMetrics(object):
     return ret
 
   def PackMetricsValues(self, values):
-    """Packs numpy values into a NestedMap of metrics."""
-    return self.metrics.Pack(self._Zip(values))
+    """Packs numpy values into a dict of metrics."""
+    for k, v in zip(sorted(self._metrics.keys()), self._Zip(values)):
+      self._metrics[k] = v
+
+
+class AUCMetric(BaseMetric):
+  """Class to compute the AUC score for binary classification."""
+
+  def __init__(self, mode='roc', samples=-1):
+    """Constructor of the class.
+
+    Args:
+      mode: Possible values: 'roc' or 'pr'.
+      samples: The number of sample points to compute the AUC. If -1, include
+        all points seen thus far.
+
+    Raises:
+      ImportError: If user has not installed sklearn, raise an ImportError.
+    """
+    if not HAS_SKLEARN:
+      raise ImportError('AUCMetric depends on sklearn.')
+    self._mode = mode
+    self._samples = samples
+    self._label = []
+    self._prob = []
+    self._weight = []
+    if self._mode == 'roc':
+      self._curve_fn = sklearn.metrics.roc_curve
+      self._score_fn = sklearn.metrics.roc_auc_score
+      self._plot_labels = ['False Positive Rate', 'True Positive Rate']
+    elif self._mode == 'pr':
+      self._curve_fn = sklearn.metrics.precision_recall_curve
+      self._score_fn = sklearn.metrics.average_precision_score
+      self._plot_labels = ['Recall', 'Precision']
+    else:
+      raise ValueError('mode in AUCMetric must be one of "roc" or "pr".')
+
+  def Update(self, label, prob, weight=None):
+    """Updates the metrics.
+
+    Args:
+      label: An array to specify the groundtruth binary labels. Values must be
+        either 0 or 1.
+      prob: An array to specify the prediction probabilities. Values must be
+        within [0, 1.0].
+      weight: An array to specify the sample weight for the auc computation.
+    """
+    self._label += label
+    self._prob += prob
+    if weight:
+      self._weight += weight
+    else:
+      self._weight += [1 for _ in range(len(label))]
+
+    if self._samples > 0:
+      self._label = self._label[-self._samples:]
+      self._prob = self._prob[-self._samples:]
+      self._weight = self._weight[-self._samples:]
+
+  @property
+  def value(self):
+    return self._score_fn(self._label, self._prob, sample_weight=self._weight)
+
+  def Summary(self, name):
+
+    def _Setter(fig, axes):
+      # 20 ticks betweein 0 and 1.
+      ticks = np.arange(0, 1.05, 0.05)
+      axes.grid(b=True)
+      axes.set_xlabel(self._plot_labels[0])
+      axes.set_xticks(ticks)
+      axes.set_ylabel(self._plot_labels[1])
+      axes.set_yticks(ticks)
+      fig.tight_layout()
+
+    xs, ys, _ = self._curve_fn(
+        self._label, self._prob, sample_weight=self._weight)
+    if self._mode == 'pr':
+      # Swap because sklearn returns <'precision', 'recall'>.
+      xs, ys = ys, xs
+    ret = plot.Curve(name=name, figsize=(12, 12), xs=xs, ys=ys, setter=_Setter)
+    ret.value.add(tag=name, simple_value=self.value)
+    return ret
+
+
+class CorrelationMetric(BaseMetric):
+  """Class to compute correlation."""
+
+  def __init__(self, mode='pearson', samples=-1):
+    """Constructor of the class.
+
+    Args:
+      mode: Possible values: 'pearson', 'spearman', 'kendalltau'.
+      samples: The number of sample points to compute the correlation. If -1,
+        include all points seen thus far.
+
+    Raises:
+      ImportError: If user has not installed scipy.stats, raise an ImportError.
+    """
+    if not HAS_SCIPY_STATS:
+      raise ImportError('CorrelationMetric depends on scipy.stats.')
+
+    assert mode in ['pearson', 'spearman', 'kendalltau']
+    self._mode = mode
+    self._samples = samples
+    self._target = []
+    self._pred = []
+
+  def Update(self, target, pred):
+    """Updates the metrics.
+
+    Args:
+      target: An array to specify the groundtruth float target.
+      pred: An array to specify the prediction.
+    """
+    self._target += target
+    self._pred += pred
+
+    if self._samples > 0:
+      self._target = self._target[-self._samples:]
+      self._pred = self._pred[-self._samples:]
+
+  @property
+  def value(self):
+    # only use the correlation, p-value is ignored.
+    if self._mode == 'pearson':
+      return scipy.stats.pearsonr(self._target, self._pred)[0]
+    elif self._mode == 'spearman':
+      return scipy.stats.spearmanr(self._target, self._pred)[0]
+    else:
+      return scipy.stats.kendalltau(self._target, self._pred)[0]

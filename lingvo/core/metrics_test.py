@@ -14,17 +14,14 @@
 # ==============================================================================
 """Tests for metrics."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-from six.moves import range
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import metrics
+from lingvo.core import test_utils
+from six.moves import range
 
 
-class MetricsTest(tf.test.TestCase):
+class MetricsTest(test_utils.TestCase):
 
   def testAverageMetric(self):
     m = metrics.AverageMetric()
@@ -73,6 +70,12 @@ class MetricsTest(tf.test.TestCase):
     self.assertEqual(
         tf.Summary(value=[tf.Summary.Value(tag=name, simple_value=1.0)]),
         m.Summary(name))
+
+  def testCorrelationMetric(self):
+    m = metrics.CorrelationMetric()
+    m.Update([1.0, 2.0, 3.0], [0.1, 0.2, 0.3])
+    m.Update([1.0, 2.0, 3.0], [0.1, 0.2, 0.3])
+    self.assertEqual(1.0, m.value)
 
 
 if __name__ == '__main__':

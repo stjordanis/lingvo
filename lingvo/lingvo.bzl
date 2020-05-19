@@ -1,16 +1,15 @@
 """Implements custom rules for Lingvo."""
 
-load("@bazel_tools//tools/build_defs/pkg:pkg.bzl", "pkg_tar")
 load("@subpar//:subpar.bzl", "par_binary")
 
 def tf_copts():
     # TODO(drpng): autoconf this.
-    return ["-D_GLIBCXX_USE_CXX11_ABI=0", "-Wno-sign-compare"] + select({
+    return ["-D_GLIBCXX_USE_CXX11_ABI=0", "-Wno-sign-compare", "-mavx"] + select({
         "//lingvo:cuda": ["-DGOOGLE_CUDA=1"],
         "//conditions:default": [],
     })
 
-def lingvo_cc_library(name, srcs = [], hdrs = [], deps = []):
+def lingvo_cc_library(name, srcs = [], hdrs = [], deps = [], testonly = 0):
     native.cc_library(
         name = name,
         copts = tf_copts(),
@@ -19,6 +18,16 @@ def lingvo_cc_library(name, srcs = [], hdrs = [], deps = []):
         deps = [
             "@tensorflow_includes//:includes",
         ] + deps,
+        testonly = testonly,
+    )
+
+def lingvo_cc_test_library(name, srcs = [], hdrs = [], deps = []):
+    lingvo_cc_library(
+        name = name,
+        srcs = srcs,
+        hdrs = hdrs,
+        deps = deps + ["@com_google_googletest//:gtest"],
+        testonly = 1,
     )
 
 def lingvo_cc_binary(name, srcs = [], deps = []):
@@ -32,7 +41,7 @@ def lingvo_cc_binary(name, srcs = [], deps = []):
         ] + deps,
     )
 
-def lingvo_cc_test(name, srcs, deps = []):
+def lingvo_cc_test(name, srcs, deps = [], **kwargs):
     native.cc_test(
         name = name,
         copts = tf_copts(),
@@ -42,6 +51,7 @@ def lingvo_cc_test(name, srcs, deps = []):
             "@tensorflow_solib//:framework_lib",
             "@com_google_googletest//:gtest_main",
         ] + deps,
+        **kwargs
     )
 
 def lingvo_py_binary(*args, **kwargs):
@@ -62,7 +72,7 @@ def custom_kernel_library(name, op_def_lib, srcs, hdrs = [], deps = []):
         alwayslink = 1,
     )
 
-def gen_op_cclib(name, srcs, deps):
+def gen_op_cclib(name, srcs, deps = []):
     # TODO(drpng): gpu.
     native.cc_library(
         name = name,
@@ -75,12 +85,13 @@ def gen_op_cclib(name, srcs, deps):
         copts = tf_copts(),
     )
 
-def gen_op_pylib(name, cc_lib_name, srcs, kernel_deps):
+def gen_op_pylib(name, cc_lib_name, srcs, kernel_deps, py_deps = [], **kwargs):
     native.cc_binary(
         name = cc_lib_name + ".so",
         deps = [cc_lib_name] + kernel_deps,
         linkshared = 1,
         copts = tf_copts(),
+        **kwargs
     )
 
     native.py_library(
@@ -88,6 +99,8 @@ def gen_op_pylib(name, cc_lib_name, srcs, kernel_deps):
         srcs = srcs,
         srcs_version = "PY2AND3",
         data = [cc_lib_name + ".so"],
+        deps = py_deps,
+        **kwargs
     )
 
 def lingvo_cuda_py_test(name, tags = [], deps = [], **kwargs):
@@ -143,6 +156,10 @@ def lingvo_proto_cc(name, src, deps = []):
         name = name,
         srcs = [basename + ".pb.cc"],
         hdrs = [basename + ".pb.h"],
+    )
+    lingvo_cc_library(
+        name = "%s_cc" % name,
+        deps = [":%s" % name],
     )
 
 def lingvo_proto_py(name, src, deps = []):

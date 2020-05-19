@@ -1,3 +1,4 @@
+# Lint as: python3
 # -*- coding: utf-8 -*-
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
@@ -15,17 +16,14 @@
 # ==============================================================================
 """Tests for plot."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import numpy as np
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import plot
+from lingvo.core import test_utils
+import numpy as np
 
 
-class PlotTest(tf.test.TestCase):
+class PlotTest(test_utils.TestCase):
 
   def testToUnicode(self):
     str_str = 'pójdź kińże tę chmurność w głąb flaszy'
@@ -34,8 +32,23 @@ class PlotTest(tf.test.TestCase):
     self.assertEqual(plot.ToUnicode(str_str), uni_str)
     self.assertEqual(plot.ToUnicode(str_str), plot.ToUnicode(uni_str))
 
+  def testMatrix(self):
+    summary = plot.Matrix('summary', (4, 4), np.random.rand(10, 10))
+    self.assertEqual(len(summary.value), 1)
+    value = summary.value[0]
+    self.assertGreater(value.image.width, 0)
+    self.assertGreater(value.image.height, 0)
 
-class MatplotlibFigureSummaryTest(tf.test.TestCase):
+  def testScatter(self):
+    summary = plot.Scatter(
+        'summary', (4, 4), xs=np.random.rand(10), ys=np.random.rand(10))
+    self.assertEqual(len(summary.value), 1)
+    value = summary.value[0]
+    self.assertGreater(value.image.width, 0)
+    self.assertGreater(value.image.height, 0)
+
+
+class MatplotlibFigureSummaryTest(test_utils.TestCase):
 
   FIGSIZE = (8, 4)
   EXPECTED_DPI = 100
@@ -63,6 +76,22 @@ class MatplotlibFigureSummaryTest(tf.test.TestCase):
     self.assertEqual(len(summary.value), 1)
     value = summary.value[0]
     self.assertEqual(value.tag, 'matplotlib_figure/image')
+    self.assertEqual(value.image.width, self.EXPECTED_DPI * self.FIGSIZE[0])
+    self.assertEqual(value.image.height, self.EXPECTED_DPI * self.FIGSIZE[1])
+    self.assertEqual(value.image.colorspace, 3)
+    self.assertEqual(value.image.encoded_image_string,
+                     self.default_encoded_image)
+
+  def testCanUseAsContextManager(self):
+    with self.session() as s:
+      with plot.MatplotlibFigureSummary(
+          'context_manager_figure', self.FIGSIZE, max_outputs=1) as fig:
+        batched_data = tf.expand_dims(self.DEFAULT_DATA, 0)  # Batch size 1.
+        fig.AddSubplot([batched_data])
+      summary_str = s.run(tf.summary.merge_all(scope='context_manager_figure'))
+    summary = tf.summary.Summary.FromString(summary_str)
+    self.assertEqual(len(summary.value), 1)
+    value = summary.value[0]
     self.assertEqual(value.image.width, self.EXPECTED_DPI * self.FIGSIZE[0])
     self.assertEqual(value.image.height, self.EXPECTED_DPI * self.FIGSIZE[1])
     self.assertEqual(value.image.colorspace, 3)
@@ -219,30 +248,29 @@ class MatplotlibFigureSummaryTest(tf.test.TestCase):
     summary = tf.summary.Summary.FromString(summary_str)
     self.assertEqual(len(summary.value), 1)
 
-  def testMatrix(self):
-    summary = plot.Matrix('summary', (4, 4), np.random.rand(10, 10))
-    self.assertEqual(len(summary.value), 1)
-    value = summary.value[0]
-    self.assertGreater(value.image.width, 0)
-    self.assertGreater(value.image.height, 0)
+  def testAddMultiCurveSubplot(self):
+    with self.session(graph=tf.Graph(), use_gpu=False):
+      fig = plot.MatplotlibFigureSummary('XXX')
+      batch_size = 2
+      tensor = tf.ones([batch_size, 3])
+      paddings = tf.constant([[0., 0., 0.], [0., 1., 1.]])
+      plot.AddMultiCurveSubplot(
+          fig, [tensor, tensor],
+          paddings,
+          labels=['label1', 'label2'],
+          xlabels=tf.constant(['a', 'b']),
+          title='Title',
+          ylabel='Ylabel')
+      summary_str = self.evaluate(fig.Finalize())
 
-  def testScatter(self):
-    summary = plot.Scatter(
-        'summary', (4, 4), xs=np.random.rand(10), ys=np.random.rand(10))
-    self.assertEqual(len(summary.value), 1)
-    value = summary.value[0]
-    self.assertGreater(value.image.width, 0)
-    self.assertGreater(value.image.height, 0)
-
-  def testScatter3D(self):
-    # Passing `zs` means the plot tries to use '3d' projection, which is not
-    # installed by default, so raises a ValueError.
-    with self.assertRaisesRegexp(ValueError, 'Unknown projection'):
-      _ = plot.Scatter(
-          'summary', (4, 4),
-          xs=np.random.rand(10),
-          ys=np.random.rand(10),
-          zs=np.random.rand(10))
+    summary = tf.Summary.FromString(summary_str)
+    self.assertEqual(len(summary.value), batch_size)
+    for n, value in enumerate(summary.value):
+      self.assertEqual(value.tag, 'XXX/image/%d' % n)
+      self.assertGreater(value.image.width, 0)
+      self.assertGreater(value.image.height, 0)
+      self.assertNotEqual(value.image.encoded_image_string,
+                          self.default_encoded_image)
 
 
 if __name__ == '__main__':

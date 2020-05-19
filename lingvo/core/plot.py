@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,19 +23,20 @@ import collections
 import functools
 import traceback
 
+import lingvo.compat as tf
+from lingvo.core import py_utils
 from matplotlib.backends import backend_agg
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import six
-from six.moves import cStringIO
 from six.moves import range
-import tensorflow as tf
+from six.moves import zip
 
 
 def ToUnicode(text):
   if not isinstance(text, six.text_type):
-    text = text.decode('utf-8')
+    text = six.ensure_text(text, 'utf-8')
   return text
 
 
@@ -77,10 +79,18 @@ def AddImage(fig,
              origin='lower',
              suppress_xticks=False,
              suppress_yticks=False,
-             aspect='auto'):
+             aspect='auto',
+             vmin=None,
+             vmax=None):
   """Convenience function to plot data as an image on the given axes."""
   image = axes.imshow(
-      data, cmap=cmap, origin=origin, aspect=aspect, interpolation='nearest')
+      data,
+      cmap=cmap,
+      origin=origin,
+      aspect=aspect,
+      interpolation='nearest',
+      vmin=vmin,
+      vmax=vmax)
   if show_colorbar:
     fig.colorbar(image)
   if clim is not None:
@@ -138,10 +148,16 @@ class MatplotlibFigureSummary(object):
   Typical usage::
 
       >>> fig_helper = plot.MatplotlibFigureSummary(
-      ...    'summary_name', shared_subplot_kwargs={'xlabel': 'Time'})
+      ...     'summary_name', shared_subplot_kwargs={'xlabel': 'Time'})
       >>> fig_helper.AddSubplot([tensor1], title='tensor1')
       >>> fig_helper.AddSubplot([tensor2], title='tensor2', ylabel='Frequency')
       >>> image_summary = fig_helper.Finalize()
+
+  Can also be used as a context manager if the caller does not need the return
+  value from Finalize(), e.g.
+
+      >>> with plot.MatplotlibFigureSummary('figure') as fig:
+      ...     fig.AddSubplot([tensor1])
   """
 
   def __init__(self,
@@ -179,6 +195,12 @@ class MatplotlibFigureSummary(object):
     self._shared_subplot_kwargs = (
         shared_subplot_kwargs if shared_subplot_kwargs else {})
     self._subplots = []
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, unused_exc_type, unused_exc_value, unused_tb):
+    self.Finalize()
 
   def AddSubplot(self, tensor_list, plot_func=None, **kwargs):
     r"""Adds a subplot from tensors using plot_fun to populate the subplot axes.
@@ -244,7 +266,7 @@ def _RenderOneMatplotlibFigure(fig, plot_func, *numpy_data_list):
   plot_func(fig, *numpy_data_list)
   fig.canvas.draw()
   ncols, nrows = fig.canvas.get_width_height()
-  image = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8)
+  image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
   return image.reshape(nrows, ncols, 3)
 
 
@@ -268,7 +290,7 @@ def _RenderMatplotlibFigures(figsize, max_outputs, plot_func, *numpy_data_list):
 
   Returns:
     A numpy 4D array of type np.uint8 which can be used to generate a
-    `tf.image_summary` when converted to a tf tensor.
+    `tf.math.image_summary` when converted to a tf tensor.
   """
   batch_size = numpy_data_list[0].shape[0]
   max_outputs = min(max_outputs, batch_size)
@@ -285,8 +307,9 @@ def _RenderMatplotlibFigures(figsize, max_outputs, plot_func, *numpy_data_list):
     try:
       images.append(_RenderOneMatplotlibFigure(fig, plot_func, *data))
     except Exception as e:  # pylint: disable=broad-except
-      tf.logging.warning('Error rendering example %d using matplotlib: %s\n%s',
-                         b, e, traceback.format_exc())
+      tf.logging.warning(
+          'Error rendering example %d using matplotlib: %s\n%s', b, e,
+          traceback.format_exc())
     if len(images) == max_outputs:
       break
   plt.close(fig)
@@ -301,12 +324,20 @@ def _RenderMatplotlibFigures(figsize, max_outputs, plot_func, *numpy_data_list):
   return np.array(images)
 
 
-def _FigureToSummary(name, fig):
-  """Create tf.Summary proto from matplotlib.figure.Figure ."""
+def FigureToSummary(name, fig):
+  """Create tf.Summary proto from matplotlib.figure.Figure.
+
+  Args:
+    name: Summary name.
+    fig: A matplotlib figure object.
+
+  Returns:
+    A `tf.Summary` proto containing the figure rendered to an image.
+  """
   canvas = backend_agg.FigureCanvasAgg(fig)
   fig.canvas.draw()
   ncols, nrows = fig.canvas.get_width_height()
-  png_file = cStringIO()
+  png_file = six.BytesIO()
   canvas.print_figure(png_file)
   png_str = png_file.getvalue()
   return tf.Summary(value=[
@@ -338,10 +369,15 @@ def Image(name, figsize, image, setter=None, **kwargs):
   assert image.ndim in (2, 3), '%s' % image.shape
   fig = plt.Figure(figsize=figsize, dpi=100, facecolor='white')
   axes = fig.add_subplot(1, 1, 1)
-  AddImage(fig, axes, image, origin='upper', show_colorbar=False, **kwargs)
+  # Default show_colorbar to False if not explicitly specified.
+  show_colorbar = kwargs.pop('show_colorbar', False)
+  # Default origin to 'upper' if not explicitly specified.
+  origin = kwargs.pop('origin', 'upper')
+  AddImage(
+      fig, axes, image, origin=origin, show_colorbar=show_colorbar, **kwargs)
   if setter:
     setter(fig, axes)
-  return _FigureToSummary(name, fig)
+  return FigureToSummary(name, fig)
 
 
 def Scatter(name, figsize, xs, ys, setter=None, **kwargs):
@@ -373,7 +409,7 @@ def Scatter(name, figsize, xs, ys, setter=None, **kwargs):
   AddScatterPlot(fig, axes, xs, ys, **kwargs)
   if setter:
     setter(fig, axes)
-  return _FigureToSummary(name, fig)
+  return FigureToSummary(name, fig)
 
 
 Matrix = Image  # pylint: disable=invalid-name
@@ -400,4 +436,65 @@ def Curve(name, figsize, xs, ys, setter=None, **kwargs):
   axes.plot(xs, ys, '.-', **kwargs)
   if setter:
     setter(fig, axes)
-  return _FigureToSummary(name, fig)
+  return FigureToSummary(name, fig)
+
+
+def AddMultiCurveSubplot(fig,
+                         tensors,
+                         paddings,
+                         labels,
+                         xlabels=None,
+                         **kwargs):
+  """Adds a multi curve subplot to Matplotlib figure.
+
+  Plots one line for each entry in tensors and assigns a plot label legend.
+
+  Args:
+    fig: The Matplotlib figure.
+    tensors: List of tensors of shape [batch, length]
+    paddings: Paddings for 'tensors' with shape [batch, length] with 0. in valid
+      positions and 1. in invalid.
+    labels: A list of tensor names (strings) of the same length as 'tensors'.
+    xlabels: A string tensor of shape [batch] with an xlabel per batch.
+    **kwargs: With optional, title, xlabel, ylabel, fontsize.
+  """
+  data = []
+  row_labels = []
+  for t, l in zip(tensors, labels):
+    if t is not None:
+      data.append(py_utils.ApplyPadding(paddings, t))
+      row_labels.append(l)
+  shape = py_utils.GetShape(data[0], 2)
+  data = tf.reshape(tf.concat(data, -1), [shape[0], len(data), shape[1]])
+
+  args = [data, py_utils.LengthsFromPaddings(paddings)]
+  if xlabels is not None:
+    args.append(xlabels)
+  fig.AddSubplot(
+      args, plot_func=_AddMultiCurveRowPlots, row_labels=row_labels, **kwargs)
+
+
+def _AddMultiCurveRowPlots(fig,
+                           axes,
+                           data,
+                           length,
+                           x_label_override=None,
+                           row_labels=None,
+                           title=u'',
+                           xlabel=u'',
+                           ylabel=u'',
+                           fontsize='small'):
+  """Add a plot per row in data and cut the plot by the length."""
+  del fig
+  colors = ['b-', 'r-', 'g-', 'm-', 'y-']
+  for row in range(data.shape[0]):
+    label = row_labels[row] if row_labels else '{}'.format(row)
+    axes.plot(data[row, :length], colors[row % len(colors)], label=label)
+  axes.set_xlim([0, length])
+  axes.legend()
+  axes.set_title(ToUnicode(title), size=fontsize)
+  if x_label_override:
+    axes.set_xlabel(ToUnicode(x_label_override), size='x-small', wrap=True)
+  else:
+    axes.set_xlabel(ToUnicode(xlabel), size=fontsize)
+  axes.set_ylabel(ToUnicode(ylabel), size=fontsize)

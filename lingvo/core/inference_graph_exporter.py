@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,15 +22,14 @@ from __future__ import print_function
 import collections
 import contextlib
 import re
-
-import six
-import tensorflow as tf
-
-from google.protobuf import text_format
+import lingvo.compat as tf
 from lingvo.core import base_model
 from lingvo.core import bfloat16_variables
 from lingvo.core import inference_graph_pb2
 from lingvo.core import py_utils
+import six
+
+from google.protobuf import text_format
 
 FLAGS = tf.flags.FLAGS
 
@@ -139,7 +139,9 @@ def ConvertSubgraphDictToProto(subgraphs_dict):
 
     # Rewrite fetches and feeds to map to their tensor name instead of
     # Tensor instance.
-    named_fetches = {k: v.name for k, v in six.iteritems(fetches)}
+    named_fetches = {
+        k: v.name for k, v in six.iteritems(fetches) if v is not None
+    }
     named_feeds = {k: v.name for k, v in six.iteritems(feeds)}
 
     # Export as subgraph.
@@ -150,37 +152,64 @@ def ConvertSubgraphDictToProto(subgraphs_dict):
 
 def GetOutputOpNames(graph,
                      inference_graph_proto,
-                     preserve_colocation_nodes=True):
+                     subgraphs=None,
+                     preserve_colocation_nodes=True,
+                     preserve_saver_restore_nodes=False,
+                     preserve_extra_ops=None):
   """Gets output op names from an inference graph.
 
   Args:
     graph: The tf graph.
     inference_graph_proto: an InferenceGraph proto.
+    subgraphs: an optional list of subgraph names. If provided, only output ops
+      from these subgraphs are preserved. Otherwise, all subgraphs are included.
     preserve_colocation_nodes: a Python bool, default to True. Preserves nodes
       colocating with the closure of output ops in the returned array.
+    preserve_saver_restore_nodes: a Python bool, default to True. Preserves
+      nodes for restoring according to inference_graph_proto.saver_def.
+    preserve_extra_ops: an optional list of extra op names to preserve as long
+      as they present in the graph.
 
   Returns:
     Array of tf op names that should be preserved in the graph.
   """
   output_op_names = set()
-  for subgraph in six.itervalues(inference_graph_proto.subgraphs):
+
+  def _GetOpName(tensor_or_op_name):
+    """Returns the op name of the given node name."""
+    # Tensor names have format <op_name>:<output_index>. Some inference
+    # graphs put tensors and others put ops in the feeds/fetches (depends
+    # on how it is used). We differentiate here. We still do the lookup in
+    # the graph to sanity check (versus relying on the text manipulation).
+    # If this logic ever breaks, TensorFlow will raise a ValueError with
+    # a description of the syntax of each.
+    if re.search(r':[0-9]+$', tensor_or_op_name):
+      # Tensor-name.
+      t = graph.get_tensor_by_name(tensor_or_op_name)
+      return t.op.name
+    else:
+      op = graph.get_operation_by_name(tensor_or_op_name)
+      return op.name
+
+  for subgraph_name, subgraph in six.iteritems(inference_graph_proto.subgraphs):
+    if subgraphs and subgraph_name not in subgraphs:
+      tf.logging.info('Skip subgraph %s.', subgraph_name)
+      continue
     # Sometimes feeds aren't connected to any outputs but keep them in the graph
     # anyways to avoid errors.
     for tensor_or_op_name in (
         list(subgraph.feeds.values()) + list(subgraph.fetches.values())):
-      # Tensor names have format <op_name>:<output_index>. Some inference
-      # graphs put tensors and others put ops in the feeds/fetches (depends
-      # on how it is used). We differentiate here. We still do the lookup in
-      # the graph to sanity check (versus relying on the text manipulation).
-      # If this logic ever breaks, TensorFlow will raise a ValueError with
-      # a description of the syntax of each.
-      if re.search(r':[0-9]+$', tensor_or_op_name):
-        # Tensor-name.
-        t = graph.get_tensor_by_name(tensor_or_op_name)
-        output_op_names.add(t.op.name)
-      else:
-        op = graph.get_operation_by_name(tensor_or_op_name)
-        output_op_names.add(op.name)
+      output_op_names.add(_GetOpName(tensor_or_op_name))
+
+  if preserve_saver_restore_nodes:
+    # Only nodes for restoring is preserved. saver_def.save_tensor_name is
+    # skipped because it's only used for saving.
+    saver_def = inference_graph_proto.saver_def
+    output_op_names.add(_GetOpName(saver_def.filename_tensor_name))
+    output_op_names.add(_GetOpName(saver_def.restore_op_name))
+
+  if not preserve_colocation_nodes and not preserve_extra_ops:
+    return sorted(list(output_op_names))
 
   # We also need to preserve any nodes that are used for colocation.
   # E.g., a node may have this attr:
@@ -202,13 +231,12 @@ def GetOutputOpNames(graph,
                                               list(output_op_names))
   reachable_vars = [node.name for node in graph_def.node]
 
-  if not preserve_colocation_nodes:
-    return sorted(list(output_op_names))
-
   for node in graph.get_operations():
-    if '_class' in node.node_def.attr:
+    if preserve_extra_ops and node.name in preserve_extra_ops:
+      output_op_names.add(node.name)
+    elif preserve_colocation_nodes and '_class' in node.node_def.attr:
       for loc in node.node_def.attr['_class'].list.s:
-        loc = loc.decode('utf-8')
+        loc = six.ensure_text(loc, 'utf-8')
         if loc.startswith('loc:@'):
           loc_name = loc[5:]
           if loc_name not in reachable_vars:
@@ -271,7 +299,6 @@ class InferenceGraphExporter(object):
   def Export(cls,
              model_cfg,
              model_task_name=None,
-             per_step_inference=False,
              device_options=InferenceDeviceOptions(
                  device='',
                  retain_device_placement=False,
@@ -281,7 +308,9 @@ class InferenceGraphExporter(object):
              freeze_checkpoint=None,
              freeze_defaults=False,
              export_path=None,
-             subgraph_filter=None):
+             subgraph_filter=None,
+             random_seed=None,
+             disable_packed_input=True):
     """Exports a InferenceGraph proto with piecewise subgraphs.
 
     Sets FLAGS.enable_asserts to False unless user explicitly sets it to True.
@@ -291,16 +320,16 @@ class InferenceGraphExporter(object):
         model_registry.GetParams(modelname, 'Test') or model_params.Model().
       model_task_name: The task to generate an inference graph for. Should be
         None for single-task models.
-      per_step_inference: Whether the exported graph will be driven step-by-step
-        instead of being end-to-end.
       device_options: Device options for the accelerator used for serving.
       freeze_checkpoint: The checkpoint to load. Loads and freezes the model if
         given.
       freeze_defaults: Default initializes the graph and freeze. Useful for
         early testing of downstream tools without having a checkpoint.
       export_path: If not None, write the inference graph in ASCII to this path.
-      subgraph_filter: If not None or empty, export only this list of inference
-        subgraphs.
+      subgraph_filter: A list of subgraph names. If not None or empty, export
+        only this list of inference subgraphs.
+      random_seed: Fixes the random seed in the exported inference graph.
+      disable_packed_input: Disable packed input for inference writing purposes.
 
     Returns:
       InferenceGraph proto.
@@ -318,33 +347,34 @@ class InferenceGraphExporter(object):
     # cluster configuration.
     cls._SetClusterParams(model_cfg.cluster, device_options)
 
-    # Disable packed inputs for inference writing purposes.
-    def _DisablePackedInput(task):
-      if (_ParamExists(task, 'encoder') and
-          _ParamExists(task.encoder, 'packed_input')):
-        task.encoder.packed_input = False
-      if (_ParamExists(task, 'decoder') and
-          _ParamExists(task.decoder, 'packed_input')):
-        task.decoder.packed_input = False
-
     # Configure the model.
-    model_cfg.is_eval = True
+    model_cfg.random_seed = random_seed
     model_cfg.is_inference = True
 
-    if issubclass(model_cfg.cls, base_model.MultiTaskModel):
-      for _, task_param in model_cfg.task_params.IterParams():
-        task_param.per_step_infer = per_step_inference
-        _DisablePackedInput(task_param)
-    else:
-      model_cfg.task.per_step_infer = per_step_inference
-      _DisablePackedInput(model_cfg.task)
+    if disable_packed_input:
 
-    tf.logging.info('Model %s. Params: %s', model_cfg.name, model_cfg.ToText())
+      def _DisablePackedInput(task):
+        if (_ParamExists(task, 'encoder') and
+            _ParamExists(task.encoder, 'packed_input')):
+          task.encoder.packed_input = False
+        if (_ParamExists(task, 'decoder') and
+            _ParamExists(task.decoder, 'packed_input')):
+          task.decoder.packed_input = False
+
+      if issubclass(model_cfg.cls, base_model.MultiTaskModel):
+        for _, task_param in model_cfg.task_params.IterParams():
+          _DisablePackedInput(task_param)
+      else:
+        _DisablePackedInput(model_cfg.task)
+
+    tf.logging.info('Model %s. Params: %s', model_cfg.name,
+                         model_cfg.ToText())
 
     # Instantiate the graph.
     graph = tf.Graph()
     with graph.as_default():
-      cluster = model_cfg.cluster.cls(model_cfg.cluster)
+      tf.random.set_seed(random_seed)
+      cluster = model_cfg.cluster.Instantiate()
       device = cluster.GetPlacer()
       tpu_const_scope = _DummyScope()
       if (IsTpu(device_options) and
@@ -363,46 +393,61 @@ class InferenceGraphExporter(object):
           py_utils.UpdateDtype(model_cfg, tf.bfloat16)
           py_utils.UpdateFpropDtype(model_cfg, tf.bfloat16)
 
+        # Hard-code TPU-related flags prior to instantiating model.
         old_enable_asserts = FLAGS.enable_asserts
+        old_xla_device = FLAGS.xla_device
         if IsTpu(device_options):
           FLAGS.enable_asserts = False
-        mdl = model_cfg.cls(model_cfg)
-        FLAGS.enable_asserts = old_enable_asserts
-        variables_to_restore = (
-            _MakeVariableDictionary(tf.global_variables())
-            if not mdl.ema else mdl.ema.variables_to_restore())
+          FLAGS.xla_device = 'tpu'
 
-        if bfloat16_override:
-          saver_var_spec = (
-              bfloat16_variables
-              .get_saver_spec_for_variables_with_bf16_overrides(
-                  variables_to_restore))
-        else:
-          saver_var_spec = variables_to_restore
+        # Ensure the global_step variable is created.
+        global_step_var = py_utils.GetOrCreateGlobalStepVar()
+        global_step = tf.identity(global_step_var, name='global_step_tensor')
 
-        saver = tf.train.Saver(saver_var_spec)
-        tf.variables_initializer(
-            tf.global_variables(), name='init_all_variables')
-        if IsTpu(device_options) and device_options.gen_init_op:
-          tf.group(tf.contrib.tpu.initialize_system(), name='tpu_init_op')
+        with py_utils.GlobalStepContext(global_step):
+          try:
+            mdl = model_cfg.Instantiate()
+            variables_to_restore = (
+                _MakeVariableDictionary(tf.global_variables()) if not mdl.ema
+                else mdl.ema.variables_to_restore(mdl.variables_for_ema))
 
-        model_task = mdl.GetTask(model_task_name)
+            if bfloat16_override:
+              saver_var_spec = (
+                  bfloat16_variables
+                  .get_saver_spec_for_variables_with_bf16_overrides(
+                      variables_to_restore))
+            else:
+              saver_var_spec = variables_to_restore
 
-        inference_graph_proto = inference_graph_pb2.InferenceGraph()
-        subgraphs_proto = model_task.Inference()
-        if isinstance(subgraphs_proto, dict):
-          subgraphs_proto = ConvertSubgraphDictToProto(subgraphs_proto)
-        for name, subgraph in subgraphs_proto.subgraphs.items():
-          if not subgraph_filter or name in subgraph_filter:
-            inference_graph_proto.subgraphs[name].CopyFrom(subgraph)
+            saver = tf.train.Saver(saver_var_spec)
+            tf.variables_initializer(
+                tf.global_variables(), name='init_all_variables')
+            if IsTpu(device_options) and device_options.gen_init_op:
+              tf.group(tf.tpu.initialize_system(), name='tpu_init_op')
 
-        # Add a table init op and global variable init op to the graph.
-        # Tables can be declared anywhere in the graph, so this op has to be
-        # added last.
-        tf.tables_initializer(name='init_all_tables')
+            model_task = mdl.GetTask(model_task_name)
+
+            inference_graph_proto = inference_graph_pb2.InferenceGraph()
+            subgraphs_proto = model_task.Inference()
+            if isinstance(subgraphs_proto, dict):
+              subgraphs_proto = ConvertSubgraphDictToProto(subgraphs_proto)
+            for name, subgraph in subgraphs_proto.subgraphs.items():
+              if not subgraph_filter or name in subgraph_filter:
+                inference_graph_proto.subgraphs[name].CopyFrom(subgraph)
+
+            # Add a table init op and global variable init op to the graph.
+            # Tables can be declared anywhere in the graph, so this op has to be
+            # added last.
+            tf.tables_initializer(name='init_all_tables')
+          finally:
+            # Reset TPU-related flags after model instantiation.
+            FLAGS.enable_asserts = old_enable_asserts
+            FLAGS.xla_device = old_xla_device
 
     tf.logging.info('Graph contains ops: %r',
-                    [op.name for op in graph.get_operations()])
+                         [op.name for op in graph.get_operations()])
+
+    inference_graph_proto.saver_def.CopyFrom(saver.as_saver_def())
 
     # Freezing.
     if freeze_defaults or freeze_checkpoint:
@@ -412,7 +457,8 @@ class InferenceGraphExporter(object):
         raise ValueError('freeze_checkpoint cannot be used with device ' +
                          device_options.device)
       if freeze_checkpoint:
-        tf.logging.info('Freezing graph from checkpoint: %s', freeze_checkpoint)
+        tf.logging.info('Freezing graph from checkpoint: %s',
+                             freeze_checkpoint)
         graph_def = _FreezeGraphFromCheckpoint(graph, saver, freeze_checkpoint,
                                                output_op_names)
       elif freeze_defaults:
@@ -421,7 +467,6 @@ class InferenceGraphExporter(object):
     else:
       output_op_names = GetOutputOpNames(graph, inference_graph_proto)
 
-      inference_graph_proto.saver_def.CopyFrom(saver.as_saver_def())
       # Prune the graph to just the parts we need.
       # To support restoring, we have to not prune out the restore node.
       output_op_names.append('init_all_tables')
@@ -437,7 +482,7 @@ class InferenceGraphExporter(object):
     if not device_options.retain_device_placement:
       # Clear the device so that the runtime can choose.
       tf.logging.info('Clearing device placement for: %s',
-                      device_options.device)
+                           device_options.device)
       for node in graph_def.node:
         node.ClearField('device')
       for function in graph_def.library.function:
@@ -447,7 +492,7 @@ class InferenceGraphExporter(object):
     inference_graph_proto.graph_def.CopyFrom(graph_def)
 
     if export_path:
-      with tf.gfile.Open(export_path, 'w') as f:
+      with tf.io.gfile.GFile(export_path, 'w') as f:
         f.write(text_format.MessageToString(inference_graph_proto))
     return inference_graph_proto
 
@@ -470,6 +515,8 @@ class InferenceGraphExporter(object):
 
     cluster_params.mode = 'sync'
     cluster_params.job = 'decoder'
+    cluster_params.add_summary = False
+    cluster_params.do_eval = True
     Update(cluster_params.controller)
     Update(cluster_params.worker)
     Update(cluster_params.ps)

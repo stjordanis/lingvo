@@ -18,8 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import py_utils
 from lingvo.tasks.mt import model as mt_model
 
@@ -31,7 +30,7 @@ class RNMTModel(mt_model.RNMTModel):
     """Constructs the inference subgraphs.
 
     Returns:
-      {'subgraph_name': (fetches, feeds)}
+      dict: ``{'subgraph_name': (fetches, feeds)}``
     """
     subgraphs = dict()
     with tf.name_scope('inference'):

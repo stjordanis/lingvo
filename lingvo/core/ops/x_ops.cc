@@ -16,7 +16,7 @@ limitations under the License.
 #include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/shape_inference.h"
-#include "lingvo/core/ops/x_ops_helper.h"
+#include "x_ops_helper.h"
 
 namespace tensorflow {
 namespace {
@@ -84,7 +84,8 @@ REGISTER_OP("BestStep")
 
 Determines the best global step from a history file.
 
-best_step: Scalar value for best global step.
+best_step: Shape [2]. best_step[0] is scalar value for best global step.
+  best_step[1] is scalar value for last global step.
 hist_file: A text file containing 'step score' records, or a file pattern that
     matches tf event files in the format of /path_to_file/events.out.tfevents*.
 tol: Difference between previous best score and current score must be greater
@@ -119,6 +120,7 @@ REGISTER_OP("BeamSearchStep")
     .Attr("beam_size: float")
     .Attr("num_hyps_per_beam: int")
     .Attr("valid_eos_max_logit_delta: float = 5.0")
+    .Attr("local_eos_threshold: float = -100.0")
     .Attr("merge_paths: bool = false")
     .Attr("allow_empty_terminated_hyp: bool = true")
     .Attr("ensure_full_beam: bool = false")
@@ -210,6 +212,8 @@ num_hyps_per_beam: Number of hyps in a beam.
 valid_eos_max_logit_delta: We allow </s> to terminate a hyp only if its logit
     is no more than `valid_eos_max_logit_delta` away from the logit of the best
     candidate.
+local_eos_threshold: We allow </s> to terminate a hyp if the local score for
+    </s> is greater than local_eos_threshold.
 merge_paths: If true, hyps which are identical when epsilons are removed will
     be combined into a single hyp.  The probability for that combined hyp will
     be the sum of the probabilities of the component hyps.  This can only be
@@ -267,8 +271,7 @@ in_done_hyps: A tensor of shape [t, h * b]. Each string in in_done_hyps can be
     in_done_hyps[t, i * num_beams + j] represents the i-th hypothesis for beam
     j that terminates at step t.
 src_seq_lengths: A tensor of shape [b] of the src sequence lengths.
-out_topk_hyps:
-    A string tensor of shape [b, k]. topk_hyps[i: ] contains
+out_topk_hyps: A string tensor of shape [b, k]. topk_hyps[i: ] contains
     top k terminated hyp for beam 'i', each hyp could be either an empty string
     or a serialized `Hypothesis` proto.
 k: number of highest scoring hyps to be returned for each beam.
@@ -436,12 +439,15 @@ REGISTER_OP("AsciiToTokenId")
 Converts ASCII label strings into token ids.
 
 labels: A vector of shape [batch].
-token_ids: A matrix of shape [batch, maxlen].
+token_ids:
+    A matrix of shape [batch, maxlen].
     token_ids[i, j] is the i-th sample's j-th token id.
     token_ids[i, 0] is always <s>.
-target_ids: A matrix of shape [batch, maxlen].
+target_ids:
+    A matrix of shape [batch, maxlen].
     target_ids[i, j] is the i-th sample's j-th prediction label id.
-paddings: A matrix of shape [batch, maxlen].
+paddings:
+    A matrix of shape [batch, maxlen].
     paddings[i, j] == 1.0 indicates that i-th training example'
     j-th target token is padded and should be ignored.
 append_eos: Whether to append </s> at the end and treat it as a non-padded
@@ -474,12 +480,15 @@ REGISTER_OP("StrToVocabTokens")
 Tokenizes string into white space separated tokens according to a vocab file.
 
 labels: A vector of shape [batch].
-token_ids: A matrix of shape [batch, maxlen].
+token_ids:
+    A matrix of shape [batch, maxlen].
     token_ids[i, j] is the i-th sample's j-th token id.
     token_ids[i, 0] is always <s>.
-target_ids: A matrix of shape [batch, maxlen].
+target_ids:
+    A matrix of shape [batch, maxlen].
     target_ids[i, j] is the i-th sample's j-th prediction label id.
-paddings: A matrix of shape [batch, maxlen].
+paddings:
+    A matrix of shape [batch, maxlen].
     paddings[i, j] == 1.0 indicates that i-th training example's
     j-th target token is padded and should be ignored.
 append_eos: Whether to append </s> at the end and treat it as a non-padded
@@ -565,9 +574,12 @@ The output tensor `token_ids` is a sequence of integer ids with <s> prepended.
 The output tensor `target_ids` is a sequence of integer ids with </s> appended.
 
 labels: The batch of tf.String tensors. Expected shape is [batch_size].
-token_ids: The ids with <s>. The shape is [batch_size, maxlen].
-target_ids: The ids with </s>. The shape is [batch_size, maxlen].
-paddings: The paddings. The shape is [batch_size, maxlen].
+token_ids:
+    The ids with <s>. The shape is [batch_size, maxlen].
+target_ids:
+    The ids with </s>. The shape is [batch_size, maxlen].
+paddings:
+    The paddings. The shape is [batch_size, maxlen].
 maxlen: Maximum length of token_ids/target_ids/paddings.
 tokenization_filepath: A path to a text file where each line is a word separated with space form a list of ids which are separated by ','.
 )doc");
@@ -598,8 +610,6 @@ sequences: The string sequences. The shape is [batch_size].
 vocab_filepath: A path to a text file where each line is a BPE string token.
 )doc");
 
-
-
 REGISTER_OP("GenericInput")
     .Output("out: out_types")
     .INPUT_ATTRS  // Common input attributes.
@@ -625,9 +635,304 @@ processor: A function that processes a string (one record) and returns
 dynamic_padding_dimensions: If not empty, must be the same length as out.
     Specifies the 0-indexed dimension to pad dynamically for each output.
     The output is padded to the longest tensor in the batch along the dimension.
-    The first (0-th) dimension is _not_ the batch dimension.
+    The first (0-th) dimension is _not_ the batch dimension. A value of -1
+    indicates the specified output should not be padded, eg. if the output is a
+    scalar rather than a sequence.
 dynamic_padding_constants: Must be set if `dynamic_padding_dimension` is
     provided. The constant value to use for padding.
+)doc");
+
+REGISTER_OP("StaticMapStringInt")
+    .Input("x: string")
+    .Output("y: int32")
+    .Attr("keys: list(string)")
+    .Attr("vals: list(int) = []")
+    .Attr("unk: int = -1")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      return ::tensorflow::Status::OK();
+    })
+    .Doc(R"doc(
+Maps every element of x according a static mapping.
+
+x: A Tensor of type string.
+y: A Tensor of type int32. Same shape of x.
+keys: The list of keys.
+vals: The list of values. If empty, defaults to [0 .. len(keys)).
+unk: The value when the key is not found.
+)doc");
+
+REGISTER_OP("StaticMapIntString")
+    .Input("x: int32")
+    .Output("y: string")
+    .Attr("keys: list(int) = []")
+    .Attr("vals: list(string)")
+    .Attr("unk: string = ''")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      return ::tensorflow::Status::OK();
+    })
+    .Doc(R"doc(
+Maps every element of x according a static mapping.
+
+x: A Tensor of type int32.
+y: A Tensor of type string. Same shape of x.
+keys: The list of keys. If empty, defaults to [0 .. len(keys)).
+vals: The list of values.
+unk: The value when the key is not found.
+)doc");
+
+REGISTER_OP("ComputePreconditioners")
+    .Input("inputs: num_tensors * float32")
+    .Input("exponents: num_tensors * float32")
+    .Input("global_step: int32")
+    .Attr("preconditioner_compute_graphdef: string")
+    .Attr("keys: list(string)")
+    .Attr("sync: bool = false")
+    .Attr("num_tensors: int >= 1")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Compute preconditioners for Shampoo optimizer.
+
+inputs: A list of Tensors of type float32, of statistic matrices.
+exponents: A list of scalar Tensors of type float32, exponent for matrix power.
+global_step: A scalar Tensor of type int32 which indicates the global step.
+preconditioner_compute_graphdef: A graphdef which indicates the function to run.
+keys: A list of keys indicating the name of preconditioners.
+sync: Boolean indicating whether to run preconditioning in synchronous mode.
+num_tensors: Number of tensor inputs.
+)doc");
+
+
+REGISTER_OP("GetPreconditioners")
+    .Input("shapes: num_tensors * Tshape")
+    .Output("outputs: num_tensors * float32")
+    .Output("statuses: num_tensors * bool")
+    .Attr("preconditioner_compute_graphdef: string")
+    .Attr("keys: list(string)")
+    .Attr("Tshape: {int32, int64} = DT_INT32")
+    .Attr("num_tensors: int >= 1")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      std::vector<shape_inference::ShapeHandle> shapes;
+      if (c->input("shapes", &shapes).ok()) {
+        for (int i = 0; i < shapes.size(); ++i) {
+          shape_inference::ShapeHandle out;
+          TF_RETURN_IF_ERROR(c->MakeShapeFromShapeTensor(i, &out));
+          c->set_output(i, out);
+          c->set_output(shapes.size() + i, c->Scalar());
+        }
+      }
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Get preconditioners for Shampoo optimizer.
+
+shapes: A list of Tensors of type Tshape indicating the size of preconditioner.
+outputs: A list of Tensors of type float32 which are the preconditioners.
+statuses: A list of Tensors of type bool which are the preconditioner status.
+preconditioner_compute_graphdef: A graphdef which indicates the function to run.
+keys: A list of keys indicating the name of preconditioners.
+Tshape: The data-type to use for shape.
+num_tensors: Number of tensor inputs.
+)doc");
+
+REGISTER_OP("MlPerfSubwordIdToString")
+    .Input("token_ids: int32")
+    .Input("seq_lengths: int32")
+    .Output("sequences: string")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(1));
+      return Status::OK();
+    })
+    .Attr("vocab_filepath: string")
+    .Doc(R"doc(
+Converts sequences from subword token ids to strings
+
+token_ids: A matrix of shape [batch, seq_len].
+seq_lengths: A vector of shape [batch]. seq_lengths[i] is the length of the
+    i-th sequence. Only the first seq_lengths[i] tokens in token_ids[i] are
+    valid tokens for the i-th sequence.
+sequences: A vector of shape [batch]. The converted string sequence.
+vocab_filepath: filepath to the MLPerf subword vocab file.
+)doc");
+
+REGISTER_OP("PackSequences")
+    .Input("src_actual_seq_len: int32")
+    .Input("tgt_actual_seq_len: int32")
+    .Input("packed_batch_size: int32")
+    .Input("packed_src_seq_len: int32")
+    .Input("packed_tgt_seq_len: int32")
+    .SetIsStateful()
+    .Output("src_segment_ids: int32")
+    .Output("src_segment_pos: int32")
+    .Output("src_indices_in_input: int32")
+    .Output("tgt_segment_ids: int32")
+    .Output("tgt_segment_pos: int32")
+    .Output("tgt_indices_in_input: int32")
+    .Attr("seed: int = 0")
+    .Doc(R"doc(
+Produces a packing pattern for the (src, tgt) input pair with the provided
+lengths, according to the given packed shape.
+
+src_actual_seq_len: A tensor of shape [N], where N is the input batch size.
+  This tensor contains the actual lengths for the src sequence.
+tgt_actual_seq_len: A tensor of shape [N], where N is the input batch size.
+  This tensor contains the actual lengths for the tgt sequence.
+packed_batch_size: A scalar. The output batch size. The packed output will
+  be of shape [packed_batch_size, packed_{src,tgt}_seq_len] for src and tgt,
+  respectively.
+packed_src_seq_len: A scalar. The output sequence length for src. A src input
+  with shape [N, src_input_seq_len] will be packed into an output with shape
+  [packed_batch_size, packed_src_seq_len].
+packed_tgt_seq_len: A scalar. The output sequence length for tgt. A tgt input
+  with shape [N, tgt_input_seq_len] will be packed into an output with shape
+  [packed_batch_size, packed_tgt_seq_len].
+
+{src,tgt}_segment_ids: A tensor of shape [packed_batch_size,
+  packed_{src,tgt}_seq_len]. Incrementing from 1 to indicate each segment in the
+  packed output, for src and tgt, respectively. Zero is reserved for indicating
+  padding at the end of each row.
+{src,tgt}_segment_pos: A tensor of shape [packed_batch_size,
+  packed_{src,tgt}_seq_len]. Zero-based index to indicate relative position
+  within each segment, for src and tgt, respectively. Zero is also used to
+  indicate padding. When needed, use `{src,tgt}_segment_ids` to disambiguate.
+{src,tgt}_indices_in_input: A tensor of shape [packed_batch_size,
+  packed_{src,tgt}_seq_len]. For each segment in the packed output, it contains
+  the original (zero-based) row index of each segment found in
+  `{src,tgt}_actual_seq_len`, respectively. Zero is also used to indicate
+  padding. When needed, use `{src,tgt}_segment_ids` to disambiguate.
+
+seed: Seed for random number generator, which is used when we need to drop
+  excessive input sequences. If seed is zero, use completely random seed.
+
+For example, the following input:
+  src_actual_seq_len = [3, 2, 1]
+  tgt_actual_seq_len = [4, 1, 5]
+  packed_batch_size = 2
+  packed_src_seq_len = 5
+  packed_tgt_seq_len = 5
+will result in:
+  src_segment_ids = [ [1, 1, 1, 2, 2], [1, 0, 0, 0, 0] ]
+  src_segment_pos = [ [0, 1, 2, 0, 1], [0, 0, 0, 0, 0] ]
+  src_indices_in_input = [ [0, 0, 0, 1, 1], [2, 0, 0, 0, 0] ]
+  tgt_segment_ids = [ [1, 1, 1, 1, 2], [1, 1, 1, 1, 1] ]
+  tgt_segment_pos = [ [0, 1, 2, 3, 0], [0, 1, 2, 3, 4] ]
+  tgt_indices_in_input = [ [0, 0, 0, 0, 1], [2, 2, 2, 2, 2] ]
+
+The packed sequence length can be different between src and tgt. For example,
+the following input:
+  src_actual_seq_len = [3, 2, 1]
+  tgt_actual_seq_len = [4, 1, 5]
+  packed_batch_size = 2
+  packed_src_seq_len = 4
+  packed_tgt_seq_len = 6
+will result in:
+  src_segment_ids = [ [1, 1, 1, 0], [1, 1, 2, 0] ]
+  src_segment_pos = [ [0, 1, 2, 0], [0, 1, 0, 0] ]
+  src_indices_in_input = [ [0, 0, 0, 0], [1, 1, 2, 0] ]
+  tgt_segment_ids = [ [1, 1, 1, 1, 0, 0], [1, 2, 2, 2, 2, 2] ]
+  tgt_segment_pos = [ [0, 1, 2, 3, 0, 0], [0, 0, 1, 2, 3, 4] ]
+  tgt_indices_in_input = [ [0, 0, 0, 0, 0, 0], [1, 2, 2, 2, 2, 2] ]
+
+If there are too few input sequences to pack into `output_shape`, the op pads
+the remaining elements in the output.
+
+If there are too many input sequences to pack into `output_shape`, the op drops
+input sequences. The dropping is done randomly uniformly on the input sequences
+to not bias the distribution of sequence lengths in the packed output.
+ )doc");
+
+REGISTER_OP("ApplyPacking")
+    .Input("input: T")
+    .Input("padding: T")
+    .Input("segment_ids: int32")
+    .Input("indices_in_input: int32")
+    .Output("output: T")
+    .Attr("T: type")
+    .Doc(R"doc(
+Applies a packing pattern on the input to obtain a packed output.
+
+A slightly different semantics when T is tf.string type: the output joins the
+strings that are packed on the same row, separated by `padding`.
+
+input: A tensor of shape [N, seq_len]. The input to apply the packing to.
+  For tf.string typed input, a vector of shape [N] is expected.
+padding: A scalar to indicate the padding value. This is typically the zero
+  value of T, but may not always be the case, e.g. when the input is a paddings
+  tensor, in which case caller should set padding=1.
+  For tf.string typed input, padding is used as a separator to join all the
+  strings on the same row in the output.
+segment_ids: A rank 2 tensor of shape `output_shape`.
+indices_in_input: A rank 2 tensor of shape `output_shape`.
+
+output: A tensor of shape `output_shape`. For tf.string typed input, the output
+  is a vector of strings where its length is the same as the number of rows in
+  `output_shape`.
+
+The inputs `segment_ids` and `indices_in_input` can be obtained from the outputs
+of an `PackSequence` op (though only the src or the tgt tensors are needed).
+
+Note that ApplyPacking is done on a per column basis (either on the src or on
+the tgt), as opposed to in PackSequences, when both src and tgt columns must be
+processed together within the same op.
+ )doc");
+
+REGISTER_OP("Mass")
+    .Input("ids: int32")
+    .Input("weights: float32")
+    .Input("actual_seq_len: int32")
+    .Attr("mask_id: int")
+    .Attr("mask_ratio: float = 0.5")
+    .Attr("mask_minlen: int = 0")
+    .Attr("span_len: int = 100000")
+    .Attr("random_start_prob: float = 0.6")
+    .Attr("keep_prob: float = 0.1")
+    .Attr("rand_prob: float = 0.1")
+    .Attr("mask_prob: float = 0.8")
+    // TODO(alisonlui): This flag is rarely used; remove after verification.
+    .Attr("mask_target: bool = True")
+    .Attr("vocab_size: int")
+    .Attr("first_unreserved_id: int = 4")
+    .Output("src_ids: int32")
+    .Output("tgt_ids: int32")
+    .Output("tgt_labels: int32")
+    .Output("tgt_weights: float32")
+    .Doc(R"doc(
+Applies masking to implement MASS.
+
+ids: Tensor of shape [batch_size, max_seq_len] containing the token ids.
+  Should include EOS token </s>.
+weights: Tensor of shape [batch_size, max_seq_len].
+actual_seq_len: Tensor of shape [batch_size].
+
+mask_id: The id to use for the mask token.
+mask_ratio: Proportion of src to mask.
+mask_minlen: Skip sentences too short to mask at least this many tokens.
+span_len: Split mask_len into segments of this size and randomly distribute
+those across the src.
+random_start_prob: The probability that the placement of masked segments will be
+  entirely random. The remaining cases are split evenly between masking at the
+  beginning and at the end of the src.
+keep_prob/rand_prob/mask_prob: The probability that a token to be masked will
+be unchanged, replaced with a random token in the vocab, or replaced with the
+mask_id, respectively. Must sum to 1.
+mask_target: whether to mask the target (the mask will be the inverse of that of
+  the src).
+vocab_size: Vocab size used when selecting a random token to replace a masked
+  token.
+first_unreserved_id: Tokens greater than or equal to this may be selected at
+  random to replace a masked token.
+
+src_ids: Masked ids. E.g. s1 s2 s3 m m </s>
+tgt_ids: Right-shifted ids with BOS token added, where the mask is the
+  positional inverse of that of the source unless mask_target=False.
+  E.g. m m m s3 s4 m
+tgt_labels: E.g. s1 s2 s3 s4 s5 </s>
+tgt_weights: weights are zeroed wherever the target is masked.
 )doc");
 
 }  // namespace

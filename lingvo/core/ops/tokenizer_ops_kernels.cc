@@ -12,20 +12,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
-#include "lingvo/core/ops/tokenizer_op_headers.h"
-
 #include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "lingvo/core/ops/ascii_tokenizer.h"
+#include "lingvo/core/ops/simple_vocab.h"
+#include "lingvo/core/ops/tokenizer_op_headers.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/lib/strings/numbers.h"
 #include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/env.h"
-#include "lingvo/core/ops/ascii_tokenizer.h"
-#include "lingvo/core/ops/simple_vocab.h"
 
 namespace tensorflow {
 namespace lingvo {
@@ -56,7 +56,7 @@ class StrToVocabTokensOp : public OpKernel {
   void Compute(OpKernelContext* ctx) override {
     const Tensor* labels;
     OP_REQUIRES_OK(ctx, ctx->input("labels", &labels));
-    const auto& t_label = labels->vec<string>();
+    const auto& t_label = labels->vec<tstring>();
     const int32 b_size = labels->dim_size(0);
     Tensor token_ids(DT_INT32, TensorShape({b_size, maxlen_}));
     Tensor target_ids(DT_INT32, TensorShape({b_size, maxlen_}));
@@ -177,7 +177,7 @@ class NgramIdToTokenOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({batch}), &out));
     const auto& t_ids = token_ids->matrix<int32>();
     const auto& t_seq_lens = seq_lengths->vec<int32>();
-    auto t_out = out->template vec<string>();
+    auto t_out = out->template vec<tstring>();
     for (int i = 0; i < batch; ++i) {
       const int len_i = std::max(0, t_seq_lens(i));
       std::vector<int32> ids_i(len_i);
@@ -235,7 +235,7 @@ class BpeIdsToWordsOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({batch}), &out));
     const auto& t_ids = token_ids->matrix<int32>();
     const auto& t_seq_lens = seq_lengths->vec<int32>();
-    auto t_out = out->template vec<string>();
+    auto t_out = out->template vec<tstring>();
     for (int i = 0; i < batch; ++i) {
       const int len_i = std::max(0, t_seq_lens(i));
       std::vector<string> labels;
@@ -279,8 +279,13 @@ class BpeWordsToIdsOp : public OpKernel {
       // Each line:
       // string int1,int2,int3,...,intn
       std::vector<string> parts = str_util::Split(line, ' ');
+      std::vector<string> split_parts_1 = str_util::Split(parts[1], ',');
       std::vector<int32> ids;
-      str_util::SplitAndParseAsInts(parts[1], ',', &ids);
+      for (const string& str_id : split_parts_1) {
+        int32 id;
+        strings::safe_strto32(str_id, &id);
+        ids.push_back(id);
+      }
       string_to_ids_map_[parts[0]] = ids;
     }
   }
@@ -288,7 +293,7 @@ class BpeWordsToIdsOp : public OpKernel {
   void Compute(OpKernelContext* ctx) override {
     const Tensor* labels;
     OP_REQUIRES_OK(ctx, ctx->input("labels", &labels));
-    const auto& t_label = labels->vec<string>();
+    const auto& t_label = labels->vec<tstring>();
     const int32 b_size = labels->dim_size(0);
     Tensor* token_ids = nullptr;
     Tensor* target_ids = nullptr;

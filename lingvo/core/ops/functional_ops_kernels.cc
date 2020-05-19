@@ -15,12 +15,12 @@ limitations under the License.
 
 #include <vector>
 
+#include "lingvo/core/ops/mutex.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/platform/thread_annotations.h"
-#include "lingvo/core/ops/mutex.h"
 
 namespace tensorflow {
 namespace lingvo {
@@ -30,7 +30,6 @@ typedef FunctionLibraryRuntime::Handle FHandle;
 
 void SetRunOptions(OpKernelContext* ctx, FunctionLibraryRuntime::Options* opts,
                    bool always_collect_stats) {
-  opts->step_id = ctx->step_id();
   opts->rendezvous = ctx->rendezvous();
   opts->cancellation_manager = ctx->cancellation_manager();
   if (always_collect_stats) {

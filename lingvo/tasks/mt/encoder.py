@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,12 +19,7 @@ from __future__ import division
 from __future__ import print_function
 
 import math
-
-
-from six.moves import range
-import tensorflow as tf
-
-from lingvo.core import base_encoder
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import layers
 from lingvo.core import model_helper
@@ -31,12 +27,13 @@ from lingvo.core import py_utils
 from lingvo.core import rnn_cell
 from lingvo.core import summary_utils
 from lingvo.tasks.mt import layers as mt_layers
+from six.moves import range
 
 tf.flags.DEFINE_bool('transformer_encoder_truncates_inputs', False,
                      'Whether TransformerEncoder truncates inputs to max len.')
 
 
-class MTEncoderV1(base_encoder.BaseEncoder):
+class MTEncoderV1(base_layer.BaseLayer):
   """Machine translation encoder version 1."""
 
   @classmethod
@@ -54,13 +51,13 @@ class MTEncoderV1(base_encoder.BaseEncoder):
     p.Define('lstm_cell_size', 1024, 'LSTM cell size for the RNN layer.')
     p.Define('num_lstm_layers', 8, 'Number of rnn layers to create')
     p.Define('dropout_prob', 0.0, 'Prob at which we do dropout.')
-    p.Define('unidi_rnn_type', 'func', 'Options: func, native_cudnn. '
-             'func: FRNN, native_cudnn: CuDNNLSTM.')
-    p.Define(
-        'bidi_rnn_type', 'func', 'Options: func, native_cudnn. '
-        'func: BidirectionalFRNN, '
-        ' native_cudnn: BidirectionalNativeCuDNNLSTM.')
+    p.Define('unidi_rnn_type', 'func', 'Options: func. ' 'func: FRNN.')
+    p.Define('bidi_rnn_type', 'func', 'Options: func. '
+             'func: BidirectionalFRNN. ')
     p.Define('cc_schedule', None, 'Clipping cap schedule.')
+    p.Define(
+        'packed_input', False, 'If True, encoder and all layers support '
+        'multiple examples in a single sequence.')
 
     disable_vn = py_utils.VariationalNoiseParams(1.0, False, False)
     default_params_init = py_utils.WeightInit.Uniform(0.04)
@@ -145,7 +142,7 @@ class MTEncoderV1(base_encoder.BaseEncoder):
     p = self.params
     if not p.cc_schedule:
       return x
-    cap = tf.cast(self.cc_schedule.CurrentCap(theta.cc_schedule), x.dtype)
+    cap = tf.cast(self.cc_schedule.GetState(theta.cc_schedule), x.dtype)
     return tf.clip_by_value(x, -cap, cap)
 
   def FProp(self, theta, input_batch):
@@ -160,10 +157,11 @@ class MTEncoderV1(base_encoder.BaseEncoder):
 
     Returns:
       A NestedMap containing:
-        - encoded: The encoded features, a tensor of shape [time, batch, depth]
-        - padding: of shape [time, batch]
-        - segment_id: [time, batch] if packed inputs are supported by the model
-            (and all layers), or None otherwise.
+
+      - encoded: The encoded features, a tensor of shape [time, batch, depth]
+      - padding: of shape [time, batch]
+      - segment_id: [time, batch] if packed inputs are supported by the model
+        (and all layers), or None otherwise.
     """
     p = self.params
     src_segment_id = None
@@ -204,7 +202,7 @@ class MTEncoderV1(base_encoder.BaseEncoder):
           encoded=xs, padding=tf.squeeze(ps, [2]), segment_id=src_segment_id)
 
 
-class MTEncoderUniRNN(base_encoder.BaseEncoder):
+class MTEncoderUniRNN(base_layer.BaseLayer):
   """MT encoder that consists of a stack of uni-directional RNN layers."""
 
   @classmethod
@@ -219,9 +217,7 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
     p.Define('dropout_prob', 0.0, 'Prob at which we do dropout.')
     p.Define('residual_start', 2,
              'Layer at which we start residual connections.')
-    p.Define(
-        'unidi_rnn_type', 'func', 'Options: func, native_cudnn. '
-        'func: FRNN, native_cudnn: CuDNNLSTM.')
+    p.Define('unidi_rnn_type', 'func', 'Options: func. ' 'func: FRNN.')
     p.Define('cc_schedule', None, 'Clipping cap schedule.')
 
     p.Define('is_transparent', False,
@@ -230,6 +226,9 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
         'transparent_merger_tpl',
         layers.WeightedSumLayer.Params().Set(add_weight_summaries=True),
         'Merger op for layer outputs.')
+    p.Define(
+        'packed_input', False, 'If True, encoder and all layers support '
+        'multiple examples in a single sequence.')
 
     disable_vn = py_utils.VariationalNoiseParams(1.0, False, False)
     default_params_init = py_utils.WeightInit.Uniform(0.04)
@@ -293,16 +292,29 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
     else:
       return x
 
-  def FProp(self, theta, input_batch):
+  def zero_state(self, theta, batch_size):
+    return py_utils.NestedMap(rnn=[
+        self.rnn[i].zero_state(theta.rnn[i], batch_size)
+        for i in range(len(self.rnn))
+    ])
+
+  def FProp(self, theta, input_batch, state0=None):
     p = self.params
     src_segment_id = None
     with tf.name_scope(p.name):
+      # Reshape to [t, b]
       inputs = py_utils.with_dependencies([
           py_utils.assert_shape_match(tf.shape(input_batch.ids), [-1, -1]),
           py_utils.assert_shape_match(
               tf.shape(input_batch.ids), tf.shape(input_batch.paddings))
       ], tf.transpose(input_batch.ids))
       paddings = tf.expand_dims(tf.transpose(input_batch.paddings), 2)
+
+      # Setup streaming states.
+      if not state0:
+        state0 = self.zero_state(theta, tf.shape(inputs)[1])
+      state1 = py_utils.NestedMap(rnn=[None] * p.num_lstm_layers)
+
       xs = self.emb.EmbLookup(theta.emb, inputs)
       xs = self.ApplyClipping(theta, xs)
       summary_utils.histogram('input_emb', xs)
@@ -312,7 +324,8 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
       outputs_list = []
       for i in range(0, p.num_lstm_layers):
         layer = self.rnn[i]
-        ys, _ = layer.FProp(theta.rnn[i], xs, ps)
+        ys, state1.rnn[i] = layer.FProp(
+            theta.rnn[i], xs, ps, state0=state0.rnn[i])
         ys = self.dropout.FProp(theta.dropout, ys)
         if i >= p.residual_start:
           xs += ys  # Residual skip
@@ -327,10 +340,13 @@ class MTEncoderUniRNN(base_encoder.BaseEncoder):
                                            outputs_list)
 
       return py_utils.NestedMap(
-          encoded=xs, padding=tf.squeeze(ps, [2]), segment_id=src_segment_id)
+          encoded=xs,
+          padding=tf.squeeze(ps, [2]),
+          segment_id=src_segment_id,
+          state=state1)
 
 
-class MTEncoderBiRNN(base_encoder.BaseEncoder):
+class MTEncoderBiRNN(base_layer.BaseLayer):
   """MT encoder that consists of a stack of bi-directional RNN layers."""
 
   @classmethod
@@ -349,10 +365,8 @@ class MTEncoderBiRNN(base_encoder.BaseEncoder):
     p.Define('residual_start', 2,
              'Layer at which we start residual connections.')
     p.Define('encoder_out_dim', 1024, 'Depth of the encoder output.')
-    p.Define(
-        'bidi_rnn_type', 'func', 'Options: func, native_cudnn. '
-        'func: BidirectionalFRNN, '
-        ' native_cudnn: BidirectionalNativeCuDNNLSTM.')
+    p.Define('bidi_rnn_type', 'func', 'Options: func. '
+             'func: BidirectionalFRNN. ')
     p.Define('cc_schedule', None, 'Clipping cap schedule.')
 
     p.Define('is_transparent', False,
@@ -361,6 +375,9 @@ class MTEncoderBiRNN(base_encoder.BaseEncoder):
         'transparent_merger_tpl',
         layers.WeightedSumLayer.Params().Set(add_weight_summaries=True),
         'Merger op for layer outputs.')
+    p.Define(
+        'packed_input', False, 'If True, encoder and all layers support '
+        'multiple examples in a single sequence.')
 
     disable_vn = py_utils.VariationalNoiseParams(1.0, False, False)
     default_params_init = py_utils.WeightInit.Uniform(0.04)
@@ -497,7 +514,7 @@ class MTEncoderBiRNN(base_encoder.BaseEncoder):
           encoded=xs, padding=tf.squeeze(ps, [2]), segment_id=src_segment_id)
 
 
-class TransformerEncoder(base_encoder.BaseEncoder):
+class TransformerEncoder(base_layer.BaseLayer):
   """Transformer stack with sinusoidal positional embeddings and attention.
 
   Implements the encoder of 'Attention is All You Need':
@@ -519,17 +536,35 @@ class TransformerEncoder(base_encoder.BaseEncoder):
                      1.0 / math.sqrt(1024)),
                  scale_sqrt_depth=True), 'Embedding layer params.')
 
+    p.Define('shared_emb', None, 'Embedding shared with Decoder.')
+
     # Positional embedding related
     p.Define(
         'position_emb',
         layers.PositionalEmbeddingLayer.Params().Set(embedding_dim=1024),
         'Positional Embedding layer params.')
 
+    # TODO(miachen): Extend this to more general logic of adding multiple
+    # embedding fields.
+    # Task embedding related
+    p.Define('task_emb', None, 'Task embedding layer params.')
+
     p.Define('model_dim', 1024, 'Characteristic depth (dimension).')
     p.Define('input_dropout_prob', 0.0, 'Prob at which we do input dropout.')
 
     p.Define('transformer_stack', mt_layers.TransformerStack.Params(),
              'TransformerStack layer params.')
+    p.Define(
+        'packed_input', False, 'If True, encoder and all layers support '
+        'multiple examples in a single sequence.')
+
+    # MASS pretraining related (https://github.com/microsoft/MASS).
+    p.Define(
+        'apply_source_mask', False, 'If True, apply source mask '
+        '(corresponding to those masked words) to encoder states.')
+    p.Define(
+        'source_mask_id', 0, 'Id for masked words in source inputs. '
+        'Only needed when p.apply_source_mask is True.')
 
     p.transformer_stack.num_transformer_layers = 6
     p.transformer_stack.transformer_tpl.tr_atten_tpl.num_attention_heads = 8
@@ -541,25 +576,39 @@ class TransformerEncoder(base_encoder.BaseEncoder):
     super(TransformerEncoder, self).__init__(params)
     p = self.params
 
+    if p.shared_emb:
+      with tf.variable_scope('shared_emb', reuse=tf.AUTO_REUSE):
+        # Naming this 'softmax' to match the name of the same component in the
+        # decoder. Variable names need to be the same in order to be reused.
+        self.CreateChild('softmax', p.shared_emb)
+
     with tf.variable_scope(p.name):
       assert p.token_emb.embedding_dim == p.position_emb.embedding_dim
       p.transformer_stack.Set(
           model_dim=p.model_dim, packed_input=p.packed_input)
       if p.model_dim != p.token_emb.embedding_dim:
-        tf.logging.warning('token_emb.embedding_dim != model_dim (%s vs. %s), '
-                           'creating a projection!')
+        tf.logging.warning(
+            'token_emb.embedding_dim != model_dim (%s vs. %s), '
+            'creating a projection!')
         proj_p = layers.ProjectionLayer.Params().Copy()
         proj_p.name = 'emb_proj'
         proj_p.input_dim = p.token_emb.embedding_dim
         proj_p.output_dim = p.model_dim
+        proj_p.batch_norm = True
         self.CreateChild('emb_proj', proj_p)
 
       # Token embeddings
-      p.token_emb.dtype = p.dtype
-      self.CreateChild('token_emb', p.token_emb)
+      if not p.shared_emb:
+        p.token_emb.dtype = p.dtype
+        self.CreateChild('token_emb', p.token_emb)
 
       # Positional embeddings
       self.CreateChild('position_emb', p.position_emb)
+
+      # Task embeddings.
+      if p.task_emb:
+        assert p.task_emb.embedding_dim == p.token_emb.embedding_dim
+        self.CreateChild('task_emb', p.task_emb)
 
       dropout_tpl = layers.DropoutLayer.Params()
       dropout_tpl.keep_prob = (1.0 - p.input_dropout_prob)
@@ -578,16 +627,22 @@ class TransformerEncoder(base_encoder.BaseEncoder):
 
         - ids: The inputs tensor. It is expected to be of shape [batch, time].
         - paddings: The paddings tensor. Expected shape [batch, time].
+        - task_ids: If p.task_emb is provided, must contain per-token task
+            ids of shape [batch, time].
 
     Returns:
-      A NestedMap containing:
-        - encoded: The encoded features, either a tensor of shape [time, batch,
-            depth], or a list of tensors if is_transparent is set in
-            transformer_stack.
-        - padding: of shape [time, batch]
-        - segment_id: [time, batch] if packed inputs are supported by the model
-            (and all layers), or None otherwise.
+      A NestedMap containing
+
+      - encoded: The encoded features, either a tensor of shape
+        [time, batch, depth], or a list of tensors if is_transparent is set in
+        transformer_stack.
+      - padding: of shape [time, batch]
+      - segment_id: [time, batch] if packed inputs are supported by the model
+        (and all layers), or None otherwise.
+      - embedded_inputs: [time, batch, depth] embedded inputs tokens without
+        positional encodings.
     """
+
     p = self.params
     with tf.name_scope(p.name):
       src_segment_id = None
@@ -622,10 +677,18 @@ class TransformerEncoder(base_encoder.BaseEncoder):
       max_time = tf.shape(input_ids)[1]
 
       # Input token embeddings + positional embeddings
-      input_embs = self.token_emb.EmbLookup(theta.token_emb,
+      if not p.shared_emb:
+        input_embs = self.token_emb.EmbLookup(theta.token_emb,
+                                              tf.reshape(input_ids, [-1]))
+      else:
+        input_embs = self.softmax.EmbLookup(theta.softmax,
                                             tf.reshape(input_ids, [-1]))
+
       input_embs = tf.reshape(input_embs,
                               [-1, max_time, p.token_emb.embedding_dim])
+      # [time, batch, dim]
+      orig_input_embs = tf.transpose(input_embs, [1, 0, 2])
+
       if p.packed_input:
         position_embs = self.position_emb.FPropWithPosition(
             theta.position_emb, src_segment_pos)
@@ -634,11 +697,14 @@ class TransformerEncoder(base_encoder.BaseEncoder):
         position_embs = tf.reshape(position_embs,
                                    [1, max_time, p.token_emb.embedding_dim])
       input_embs += position_embs
+      if p.task_emb:
+        input_embs += self.task_emb.EmbLookup(theta.task_emb,
+                                              input_batch.task_ids)
 
       if p.model_dim != p.token_emb.embedding_dim:
         input_embs = self.emb_proj.FProp(theta.emb_proj, input_embs)
 
-      paddings = tf.transpose(paddings)
+      paddings = tf.cast(tf.transpose(paddings), py_utils.FPropDtype(p))
       if p.packed_input:
         src_segment_id = tf.transpose(src_segment_id)
       input_embs = self.input_dropout.FProp(theta.input_dropout, input_embs)
@@ -646,7 +712,25 @@ class TransformerEncoder(base_encoder.BaseEncoder):
       # [time, batch, dim]
       transformer_input = tf.transpose(input_embs, [1, 0, 2])
 
+    if not self.do_eval and p.apply_source_mask:
+      # Augment padding for masked source word positions.
+      dtype = paddings.dtype
+      source_mask = tf.where(
+          tf.equal(input_ids, p.source_mask_id),
+          tf.ones_like(input_ids, dtype=dtype),
+          tf.zeros_like(input_ids, dtype=dtype))
+      # Make sure padding is between 0 and 1.
+      paddings = tf.clip_by_value(paddings + tf.transpose(source_mask), 0.0,
+                                  1.0)
+
     encoded, padding, segment_id = self.transformer_stack.FProp(
         theta.transformer_stack, transformer_input, paddings, src_segment_id)
     return py_utils.NestedMap(
-        encoded=encoded, padding=padding, segment_id=segment_id)
+        encoded=encoded,
+        padding=padding,
+        segment_id=segment_id,
+        embedded_inputs=orig_input_embs)
+
+  def FPropFullSequence(self, theta, ids, paddings):
+    return self.FProp(theta, py_utils.NestedMap(ids=ids,
+                                                paddings=paddings))['encoded']

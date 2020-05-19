@@ -24,16 +24,37 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "lingvo/core/ops/mutex.h"
+#include "lingvo/core/ops/rope.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/thread_annotations.h"
-#include "lingvo/core/ops/mutex.h"
-#include "lingvo/core/ops/rope.h"
 
 namespace tensorflow {
 namespace lingvo {
+
+// TODO(oday): Separate some constants and Record to other file.
+// TODO(oday): Change "source_id" to another appropriate name, because this is
+// one of the typically used symbols in some tasks (e.g., NMTExample has such
+// field for source tokens).
+
+constexpr int kDefaultSourceId = 0;
+
+// A data structure representing a record with its context information.
+// TODO(oday): The typename may sound too simple to represent itself. Consider
+// to revise it if it may become really problematic.
+struct Record {
+  // Byte sequence representing the record value.
+  Rope value;
+
+  // ID of the source of the record, typically an index of the given file
+  // pattern list. This field is used to determine where the record comes from,
+  // and is useful to specify the source when reading from multiple input
+  // sources.
+  int source_id;
+};
 
 // An interface to iterate sequentially a set of record (Rope).
 class RecordIterator {
@@ -44,12 +65,40 @@ class RecordIterator {
   // fills in 'key' and 'value'.
   virtual bool Next(string* key, Rope* value) = 0;
 
+  // Resets this iterator, if possible. Sub-classes should return true on a
+  // successful reset. If 'randomize_location' is true, then the iterator is
+  // moved to point to a random record (if supported).
+  virtual bool ResetIterator(bool randomize_location) {
+    return false;
+  }
+
   // Register a method to create a RecordIterator for the 'type_name'.
   typedef std::function<RecordIterator*(const string&)> FactoryMethod;
   static bool Register(const string& type_name, FactoryMethod method);
 
+  // As above, but also register a custom method for parsing file_pattern
+  // strings into lists of shards.
+  typedef std::function<Status(const string&, std::vector<std::string>*)>
+      PatternParserMethod;
+  static bool RegisterWithPatternParser(const string& type_name,
+                                        FactoryMethod method,
+                                        PatternParserMethod parser_method);
+
   // Returns a record iterator for 'filename' of 'type_name'.
   static RecordIterator* New(const string& type_name, const string& filename);
+
+  // Returns the prefix in a file pattern, or an empty string if not exist.
+  // Example: "tfrecord:data_dir/data.tfrecord" => "tfrecord"
+  static string GetFilePatternPrefix(const string& file_pattern);
+
+  // Similar to the function above, but in addition to returning the prefix also
+  // modifies the file_pattern by stripping away the prefix portion.
+  static string StripPrefixFromFilePattern(string* file_pattern);
+
+  // Parse a file pattern into a list of matching files.
+  static Status ParsePattern(const string& type_name,
+                             const string& file_pattern_list,
+                             std::vector<string>* filenames);
 };
 
 // RecordYielder defines an interface that should be used for producing value
@@ -66,10 +115,10 @@ class RecordIterator {
 //   opts.bufsize = 1000000;    // A randomized buffer with 1M records.
 //   opts.parallelism = 8;      // Use 8 iterators to iterate through all files.
 //   RecordYielder* yielder = BasicRecordYielder::New(opts);
-//   Rope val;
+//   Record record;
 //   while (true) {
-//     yielder->Yield(&val);
-//     // process val
+//     yielder->Yield(&record);
+//     // process record.
 //   }
 //   yielder->Close();
 //
@@ -78,8 +127,12 @@ class RecordYielder {
  public:
   virtual ~RecordYielder();
 
-  // Yields one 'value'.
-  virtual Status Yield(Rope* value) = 0;
+  // Yields one Record.
+  // To read from multiple input sources and keep track of the source id, create
+  // a WeightedMixRecordYielder and create a BasicRecordYielder for each
+  // source. Each BasicRecordYielder can assign some fields in 'record' to
+  // indicate some characteristics of the data source.
+  virtual Status Yield(Record* record) = 0;
 
   // Stop this yielder and then delete it.
   virtual void Close() = 0;
@@ -111,8 +164,15 @@ class BasicRecordYielder : public RecordYielder {
     // Randomization buffer keeps these many records.
     int64 bufsize = 1;
 
+    // If non-zero, attempt to keep this many seconds of records in the
+    // randomization buffer. The buffer size will never exceed bufsize.
+    int64 bufsize_in_seconds = 0;
+
     // Uses this many concurrent iterators to iterate through files.
     int32 parallelism = 1;
+
+    // Source id to be supplied with yield.
+    int32 source_id = 0;
   };
 
   // Returns a record yielder according to 'opts'. A caller is responsible for
@@ -120,17 +180,29 @@ class BasicRecordYielder : public RecordYielder {
   // delete the yielder.
   static BasicRecordYielder* New(Options opts);
 
-  // Yields one 'value'.
-  Status Yield(Rope* value) override;
+  // Yields one 'record' from which the value was read.
+  Status Yield(Record* record) override;
 
   // Stop this yielder and then delete it.
   void Close() override;
 
-  // Returns the current epoch number.
-  int64 current_epoch() const { return epoch_; }
+  // Returns the current epoch number. Epoch number starts from 1 and reflects
+  // the epoch number of the record returned by the next Yield() call.
+  virtual int64 current_epoch() const {
+    // TODO(tilarids): Use ReaderMutexLock here.
+    MutexLock l(&mu_);
+    return epoch_;
+  }
+
+  // Returns the current buffer size.
+  int64 bufsize() const {
+    MutexLock l(&mu_);
+    return bufsize_;
+  }
 
  protected:
   explicit BasicRecordYielder(const Options& opts);
+  explicit BasicRecordYielder();  // USED ONLY FOR TESTS.
 
   ~BasicRecordYielder() override;
 
@@ -143,7 +215,6 @@ class BasicRecordYielder : public RecordYielder {
     Status status;                  // Shard status.
   };
   void ShardLoop(Shard* shard);
-  Status MatchFiles(const string& patterns, std::vector<string>* filenames);
 
   // Returns true iff 's' indicates the yielder should stop.
   bool ShouldFinish(const Status& s);
@@ -160,10 +231,10 @@ class BasicRecordYielder : public RecordYielder {
   // Background threads. Owned.
   thread::ThreadPool* thread_;
 
-  // Epoch number.
-  std::atomic<int64> epoch_;
+  mutable Mutex mu_;
 
-  Mutex mu_;
+  // Epoch number.
+  int64 epoch_ GUARDED_BY(mu_);
 
   // Turned to true when the yielder is deleted.
   bool stop_ GUARDED_BY(mu_) = false;
@@ -176,9 +247,15 @@ class BasicRecordYielder : public RecordYielder {
   std::vector<Rope> buf_ GUARDED_BY(mu_);
 
   // True iff we are draining an epoch.
-  bool epoch_end_ = false;
+  bool epoch_end_ GUARDED_BY(mu_) = false;
 
   int64 num_records_yielded_in_epoch_ = 0;
+
+  // Dynamically adjusted buffer size.
+  double bufsize_ GUARDED_BY(mu_);
+
+  // Number of Yield calls in the current adjustment interval.
+  int64 yields_ GUARDED_BY(mu_);
 
   // Trigger when the main loop has exited.
   Notification main_loop_done_;
@@ -191,7 +268,7 @@ class BasicRecordYielder : public RecordYielder {
 
   Condition buf_not_full_;
   bool BufNotFull() const SHARED_LOCKS_REQUIRED(mu_) {
-    return stop_ || static_cast<int64>(buf_.size()) < opts_.bufsize;
+    return stop_ || static_cast<int64>(buf_.size()) < bufsize_;
   }
 
   Condition buf_enough_;
@@ -200,7 +277,7 @@ class BasicRecordYielder : public RecordYielder {
     // the buf_ contains enough randomized elements before yielding any.
     return stop_ || !status_.ok() || (epoch_end_ && !buf_.empty()) ||
            (!epoch_end_ && static_cast<int64>(buf_.size()) >=
-                               std::max<int64>(1, opts_.bufsize / 2));
+                               std::max<int64>(1, bufsize_ / 2));
   }
 
   void ExtractValue(Rope* value) EXCLUSIVE_LOCKS_REQUIRED(mu_) {
@@ -219,6 +296,7 @@ class BasicRecordYielder : public RecordYielder {
 
   void Start();
   void MainLoop();
+  void AdjustBufferSizeLoop();
 
   // For performance debugging.
   void WaitForBufEnough() EXCLUSIVE_LOCKS_REQUIRED(mu_);

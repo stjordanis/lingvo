@@ -15,6 +15,8 @@ limitations under the License.
 
 #include <functional>
 
+#include "tensorflow/core/lib/strings/strcat.h"
+#include "lingvo/core/ops/input_common.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -24,7 +26,6 @@ limitations under the License.
 #include "tensorflow/core/lib/core/threadpool.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/util/work_sharder.h"
-#include "lingvo/core/ops/input_common.h"
 
 namespace tensorflow {
 namespace lingvo {
@@ -94,7 +95,7 @@ class GenericInputProcessor : public RecordProcessor {
 
   ~GenericInputProcessor() { delete merger_; }
 
-  Status Process(const Rope& record, int64* bucket_key,
+  Status Process(const Record& record, int64* bucket_key,
                  TensorVec* sample) override {
     // We expect that this input processor is used in conjunction with
     // RecordBatcher, which uses multiple threads to call this input
@@ -116,10 +117,12 @@ class GenericInputProcessor : public RecordProcessor {
     opts.step_container = &step_container;
     opts.runner = ThreadLocalRunner::PerThread().runner();
 
-    // The input is a single scalar string tensor.
-    TensorVec args(1);
-    args[0] = Tensor(DT_STRING, {});
-    record.AppendTo(&args[0].scalar<string>()());
+    // Generates <source_id, record> pair as the resulting Tensors.
+    TensorVec args(2);
+    args[0] = Tensor(DT_INT32, {});
+    args[0].scalar<int32>()() = record.source_id;
+    args[1] = Tensor(DT_STRING, {});
+    args[1].scalar<tensorflow::tstring>()().append(record.value.ToString());
     *bucket_key = 1;
     sample->clear();
     Status status;
@@ -142,11 +145,15 @@ class GenericInputProcessor : public RecordProcessor {
                  << DataTypeString(bucket_key_tensor.dtype());
     }
     *bucket_key = bucket_key_tensor.scalar<int32>()();
+    if (*bucket_key < 0) {
+      return tensorflow::errors::Cancelled(
+          strings::StrCat("Batch has negative bucket key: ", *bucket_key));
+    }
     sample->pop_back();
     return Status::OK();
   }
 
-  Status Merge(int64 bucket_id, const std::vector<TensorVec>& samples,
+  Status Merge(int64 bucket_size, const std::vector<TensorVec>& samples,
                TensorVec* batch) override {
     CHECK(!samples.empty());
     const auto num_samples = samples.size();
@@ -159,6 +166,9 @@ class GenericInputProcessor : public RecordProcessor {
 
       for (int j = 0; j < num_outs; ++j) {
         const int pad_dim = dynamic_padding_dimensions_[j];
+        if (pad_dim == -1) {
+          continue;
+        }
         const int pad_value = dynamic_padding_constants_[j];
 
         int64 max_length = 0;
@@ -168,7 +178,7 @@ class GenericInputProcessor : public RecordProcessor {
 
         for (int i = 0; i < samples.size(); ++i) {
           const auto& src = samples[i][j];
-          if (src.dim_size(pad_dim) < max_length) {
+          if (src.dims() > 0 && src.dim_size(pad_dim) < max_length) {
             DataType dtype = src.dtype();
             TensorShape dst_shape(src.shape());
             dst_shape.set_dim(pad_dim, max_length);
@@ -183,7 +193,7 @@ class GenericInputProcessor : public RecordProcessor {
       typedef Eigen::DSizes<Eigen::DenseIndex, 2> DSizes;        \
       dst_t.slice(DSizes(), DSizes(src_t.dimensions())) = src_t; \
     }                                                            \
-    break;
+    break
 
               CASE(float);
               CASE(int32);
@@ -229,6 +239,9 @@ class GenericInputProcessor : public RecordProcessor {
         case DT_INT64:
         case DT_STRING:
         case DT_BFLOAT16:
+        case DT_COMPLEX64:
+        case DT_COMPLEX128:
+        case DT_BOOL:
           break;
         default:
           LOG(FATAL) << DataTypeString(dtype) << " is not supported.";
@@ -250,13 +263,16 @@ class GenericInputProcessor : public RecordProcessor {
 #define CASE(T)                                                               \
   case DataTypeToEnum<T>::value:                                              \
     merged->flat_outer_dims<T>().chip<0>(j) = padded_samples[j][i].flat<T>(); \
-    break;
+    break
                         CASE(float);
                         CASE(int32);
                         CASE(int64);
-                        CASE(string);
+                        CASE(tstring);
                         CASE(uint8);
                         CASE(bfloat16);
+                        CASE(complex64);
+                        CASE(complex128);
+                        CASE(bool);
 #undef CASE
                         default:
                           LOG(FATAL) << "Unexpected " << DataTypeString(dtype);

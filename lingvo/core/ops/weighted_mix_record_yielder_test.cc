@@ -14,57 +14,20 @@ limitations under the License.
 ==============================================================================*/
 
 #include "lingvo/core/ops/weighted_mix_record_yielder.h"
+
 #include <error.h>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include "tensorflow/core/lib/core/stringpiece.h"
-#include "tensorflow/core/lib/io/path.h"
-#include "tensorflow/core/lib/strings/stringprintf.h"
-#include "tensorflow/core/platform/env.h"
 #include "lingvo/core/ops/input_common.h"
 #include "lingvo/core/ops/record_yielder.h"
+#include "lingvo/core/ops/yielder_test_helper.h"
+#include "tensorflow/core/lib/core/stringpiece.h"
+#include "tensorflow/core/lib/io/path.h"
+#include "tensorflow/core/platform/env.h"
 
 namespace tensorflow {
 namespace lingvo {
-
-void GeneratePlainTextTestData(const string& prefix, int n, int m) {
-  for (int i = 0; i < n; ++i) {
-    std::unique_ptr<WritableFile> file;
-    TF_CHECK_OK(Env::Default()->NewWritableFile(
-        io::JoinPath("/tmp", strings::StrCat(prefix, ".", i)),
-        &file));
-    for (int j = 0; j < m; ++j) {
-      TF_CHECK_OK(file->Append(
-          strings::Printf("%s:%010d\n", prefix.c_str(), m * i + j)));
-    }
-  }
-}
-
-// This only works for data generated using GeneratePlainTextTestData with
-// properly specified prefixes.
-std::unordered_map<std::string, float> ComputeInputSourceDistribution(
-    const std::vector<string>& vals) {
-  std::unordered_map<std::string, float> input_source_distribution;
-  for (const string& val : vals) {
-    const auto prefix_end = val.find(':');
-    if (prefix_end != string::npos) {
-      input_source_distribution[val.substr(0, prefix_end)] += 1.0;
-    }
-  }
-  for (auto it = input_source_distribution.begin();
-       it != input_source_distribution.end(); ++it) {
-    it->second /= vals.size();
-  }
-  return input_source_distribution;
-}
-
-class MockRecordYielder : public RecordYielder {
- public:
-  MOCK_METHOD1(Yield, Status(Rope* value));
-  MOCK_METHOD0(Close, void());
-  MOCK_CONST_METHOD0(current_epoch, int64());
-};
 
 TEST(RecordYielderTest, WeightedMixerBasicTest) {
   const int N = 10;
@@ -91,11 +54,12 @@ TEST(RecordYielderTest, WeightedMixerBasicTest) {
       WeightedMixRecordYielder::New(301, {yielder1, yielder2}, {0.5, 0.5});
 
   std::vector<string> vals;
-  Rope v;
+  Record record;
+  record.source_id = kDefaultSourceId;
   for (int i = 0; i < 2 * N * M; ++i) {
-    TF_CHECK_OK(yielder->Yield(&v));
-    VLOG(1) << i << " " << v;
-    vals.emplace_back(string(v));
+    TF_CHECK_OK(yielder->Yield(&record));
+    VLOG(1) << i << " " << record.value;
+    vals.emplace_back(string(record.value));
   }
 
   auto input_source_distribution = ComputeInputSourceDistribution(vals);
@@ -124,6 +88,7 @@ TEST(RecordYielderTest, WeightedMixerUnevenMixTest) {
   opts1.seed = 301;
   opts1.bufsize = 2000;
   opts1.parallelism = 1;
+  opts1.source_id = 0;
   BasicRecordYielder* yielder1 = BasicRecordYielder::New(opts1);
 
   BasicRecordYielder::Options opts2;
@@ -132,21 +97,29 @@ TEST(RecordYielderTest, WeightedMixerUnevenMixTest) {
   opts2.seed = 301;
   opts2.bufsize = 2000;
   opts2.parallelism = 1;
+  opts2.source_id = 1;
   BasicRecordYielder* yielder2 = BasicRecordYielder::New(opts2);
   WeightedMixRecordYielder* yielder =
       WeightedMixRecordYielder::New(301, {yielder1, yielder2}, {0.3, 0.7});
 
   std::vector<string> vals;
-  Rope v;
+  std::vector<int> source_ids;
+  Record record;
+  record.source_id = kDefaultSourceId;
   for (int i = 0; i < 2 * N * M; ++i) {
-    TF_CHECK_OK(yielder->Yield(&v));
-    VLOG(1) << i << " " << v;
-    vals.emplace_back(string(v));
+    TF_CHECK_OK(yielder->Yield(&record));
+    VLOG(1) << i << " " << record.value;
+    vals.emplace_back(string(record.value));
+    source_ids.emplace_back(record.source_id);
   }
 
   auto input_source_distribution = ComputeInputSourceDistribution(vals);
   ASSERT_NEAR(input_source_distribution["yielder1"], 0.3, 0.01);
   ASSERT_NEAR(input_source_distribution["yielder2"], 0.7, 0.01);
+
+  int32 sum_of_elems = std::accumulate(source_ids.begin(), source_ids.end(), 0);
+  float ratio = (float)(sum_of_elems) / (float)(source_ids.size());
+  ASSERT_NEAR(ratio, 0.7, 0.01);
 
   // Take couple 1024-sized batches from the vals, they should have roughly the
   // same distribution.
@@ -187,12 +160,13 @@ TEST(RecordYielderTest, WeightedMixerUnevenInputSourcesTest) {
       WeightedMixRecordYielder::New(301, {yielder1, yielder2}, {0.5, 0.5});
 
   std::vector<string> vals;
-  Rope v;
+  Record record;
+  record.source_id = kDefaultSourceId;
   // Iterate 8 times the total record count.
   for (int i = 0; i < 8 * 5 * N * M; ++i) {
-    TF_CHECK_OK(yielder->Yield(&v));
-    VLOG(1) << i << " " << v;
-    vals.emplace_back(string(v));
+    TF_CHECK_OK(yielder->Yield(&record));
+    VLOG(1) << i << " " << record.value;
+    vals.emplace_back(string(record.value));
   }
   auto input_source_distribution = ComputeInputSourceDistribution(vals);
   ASSERT_NEAR(input_source_distribution["yielder1"], 0.5, 0.01);
@@ -212,7 +186,6 @@ TEST(RecordYielderTest, WeightedMixerUnevenInputSourcesTest) {
 }
 
 TEST(RecordYielderTest, RecordYielderRetryLoop) {
-  // It's safe to create mock record yielders on stack as they will be
   MockRecordYielder yielder1;
   MockRecordYielder yielder2;
   // Yielder1 always returns OK. Yielder2 returns DEADLINE_EXCEEDED 3 times in a
@@ -232,11 +205,12 @@ TEST(RecordYielderTest, RecordYielderRetryLoop) {
   WeightedMixRecordYielder* yielder =
       WeightedMixRecordYielder::New(304, {&yielder1, &yielder2}, {0.5, 0.5});
 
-  Rope v;
+  Record record;
+  record.source_id = kDefaultSourceId;
   for (int i = 0; i < 10; ++i) {
     // Thanks to the seed selected every child yielder will be selected exactly
     // 5 times.
-    TF_CHECK_OK(yielder->Yield(&v));
+    TF_CHECK_OK(yielder->Yield(&record));
   }
   EXPECT_CALL(yielder1, Close());
   EXPECT_CALL(yielder2, Close());

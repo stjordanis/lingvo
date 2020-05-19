@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,15 +23,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import py_utils
 from lingvo.core import recurrent
 
 
 def _ComputePaddings(ids, eos_id):
-  is_eos = tf.to_int32(tf.equal(ids, eos_id))
+  is_eos = tf.cast(tf.equal(ids, eos_id), tf.int32)
   # eos_in_prefix[i, j] = any(ids[i, k] == eos_id for k in range(j))
   eos_in_prefix = tf.cumsum(is_eos, axis=-1, exclusive=True)
   return tf.where(
@@ -71,7 +71,8 @@ class TargetSequenceSampler(base_layer.BaseLayer):
       post_step_callback: decoder._PostBeamSearchStepCallback.
 
     Returns:
-      A NestedMap containing the following tensors:
+      A NestedMap containing the following tensors
+
       - 'logits': [batch, max_target_length, vocab_size], representing the
         distribution from which target sequences are sampled.
       - 'ids': [batch, max_target_length] of int32, representing the target
@@ -82,20 +83,25 @@ class TargetSequenceSampler(base_layer.BaseLayer):
     """
     p = self.params
     assert p.temperature > 0
+    if getattr(encoder_outputs, 'segment_id', 1) is None:
+      # Remove None values, which are not supported by recurrent.
+      del encoder_outputs['segment_id']
+    # init_state_callback may modify 'encoder_outputs', e.g., by inserting
+    # 'packed_src'.
+    bs_result, bs_state = init_state_callback(
+        decoder_theta, encoder_outputs, num_hyps_per_beam=1)
     # 'recurrent_theta' represents all cross-timestep information used by the
     # recurrent loop below, including layer theta and encoder outputs.
     recurrent_theta = py_utils.NestedMap(
         theta=decoder_theta,
         random_seed=random_seed,
         encoder_outputs=encoder_outputs)
-    bs_result, bs_state = init_state_callback(
-        recurrent_theta.theta, encoder_outputs, num_hyps_per_beam=1)
     batch = tf.shape(bs_result.log_probs)[0]
     recurrent_state0 = py_utils.NestedMap(
         timestep=tf.zeros(shape=[], dtype=tf.int32),
         logits=bs_result.log_probs,
         # Start with target_sos_id.
-        ids=tf.fill([batch], tf.to_int32(p.target_sos_id)),
+        ids=tf.fill([batch], tf.cast(p.target_sos_id, tf.int32)),
         bs_state=bs_state)
     inputs = py_utils.NestedMap(dummy=tf.zeros([p.target_seq_len, batch]))
 
@@ -115,24 +121,28 @@ class TargetSequenceSampler(base_layer.BaseLayer):
         state1.logits = bs_result.log_probs
         # Sample ids from logits. [batch].
         state1.ids = tf.reshape(
-            tf.contrib.stateless.stateless_multinomial(
+            tf.random.stateless_categorical(
                 state1.logits / p.temperature,
                 num_samples=1,
                 seed=tf.stack([recurrent_theta.random_seed, state0.timestep]),
-                output_dtype=state0.ids.dtype,
+                dtype=state0.ids.dtype,
                 name='sample_next_id'), [batch])
         if 'is_last_chunk' in bs_result and p.target_eoc_id >= 0:
           state1.ids = tf.where(
-              tf.logical_and(bs_result.is_last_chunk,
-                             tf.equal(state1.ids, p.target_eoc_id)),
+              tf.math.logical_and(bs_result.is_last_chunk,
+                                  tf.equal(state1.ids, p.target_eoc_id)),
               tf.fill(tf.shape(state1.ids), p.target_eos_id), state1.ids)
         state1.bs_state = post_step_callback(recurrent_theta.theta,
                                              recurrent_theta.encoder_outputs,
                                              state1.ids, bs_state1)
       return state1, py_utils.NestedMap()
 
-    accumulated_states, _ = recurrent.Recurrent(recurrent_theta,
-                                                recurrent_state0, inputs, Step)
+    accumulated_states, _ = recurrent.Recurrent(
+        recurrent_theta,
+        recurrent_state0,
+        inputs,
+        Step,
+        allow_implicit_capture=True)
     result = py_utils.NestedMap(
         logits=tf.transpose(accumulated_states.logits, [1, 0, 2]),
         ids=tf.transpose(accumulated_states.ids))

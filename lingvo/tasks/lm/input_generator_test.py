@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,18 +15,14 @@
 # ==============================================================================
 """Tests for lm.input_generator."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import os
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.tasks.lm import input_generator
 
 
-class InputGeneratorTest(tf.test.TestCase):
+class InputGeneratorTest(test_utils.TestCase):
 
   def _InputParams(self):
     p = input_generator.LmInput.Params()
@@ -42,9 +39,9 @@ class InputGeneratorTest(tf.test.TestCase):
   def testLmInputGen(self):
     p = self._InputParams()
 
-    with self.session(use_gpu=False) as sess:
-      inp = p.cls(p)
-      inp_batch = sess.run(inp.InputBatch())
+    with self.session(use_gpu=False):
+      inp = p.Instantiate()
+      inp_batch = self.evaluate(inp.GetPreprocessedInputBatch())
       print(inp_batch)
       # pyformat: disable
       # pylint: disable=line-too-long

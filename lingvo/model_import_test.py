@@ -14,13 +14,10 @@
 # ==============================================================================
 """Test model imports."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import tensorflow as tf
-
-from lingvo import model_imports  # pylint: disable=unused-import
+from lingvo import model_imports
+import lingvo.compat as tf
 
 if __name__ == '__main__':
+  model_imports.ImportAllParams()
   tf.test.main()

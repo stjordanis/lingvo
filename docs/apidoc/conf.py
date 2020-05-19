@@ -62,15 +62,18 @@ autodoc_member_order = 'bysource'
 napoleon_google_docstring = True
 default_role = 'py:obj'
 intersphinx_mapping = {
-    'python': ('https://docs.python.org/2.7', None),
+    'python': ('https://docs.python.org/3.7', None),
     'numpy': ('http://docs.scipy.org/doc/numpy/', None),
 }
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
+
+
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
+from docutils.transforms import Transform
 from recommonmark.parser import CommonMarkParser
 source_parsers = {
     '.md': CommonMarkParser,
@@ -199,17 +202,15 @@ epub_exclude_files = ['search.html']
 todo_include_todos = True
 
 
-from docutils.transforms import Transform
-
-
 class ResetFlags(Transform):
 
   default_priority = 999
 
   def apply(self):
-    import tensorflow as tf
-    for flag in list(tf.flags.FLAGS):
-      delattr(tf.flags.FLAGS, flag)
+    from absl import flags  # pylint: disable=g-import-not-at-top
+    for flag in list(flags.FLAGS):
+      if flag not in ('showprefixforinfo',):
+        delattr(flags.FLAGS, flag)
 
 
 def setup(app):

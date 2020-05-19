@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,12 +20,11 @@ from __future__ import division
 from __future__ import print_function
 
 import subprocess
-
-import tensorflow as tf
-
-from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
+import lingvo.compat as tf
 from lingvo.core import py_utils
 from lingvo.tasks.asr import frontend as asr_frontend
+
+from tensorflow.python.ops import gen_audio_ops as audio_ops  # pylint: disable=g-direct-tensorflow-import
 
 
 # There are two ways to decode a wav in tensorflow:
@@ -55,7 +55,7 @@ def DecodeWav(input_bytes):
   Returns:
     A pair of Tensor for sample rate, decoded samples.
   """
-  result = contrib_audio.decode_wav(input_bytes)
+  result = tf.audio.decode_wav(input_bytes)
   return result.sample_rate, result.audio
 
 
@@ -63,12 +63,12 @@ def AudioToMfcc(sample_rate, audio, window_size_ms, window_stride_ms,
                 num_coefficients):
   window_size_samples = sample_rate * window_size_ms // 1000
   window_stride_samples = sample_rate * window_stride_ms // 1000
-  spectrogram = contrib_audio.audio_spectrogram(
+  spectrogram = audio_ops.audio_spectrogram(
       audio,
       window_size=window_size_samples,
       stride=window_stride_samples,
       magnitude_squared=True)
-  mfcc = contrib_audio.mfcc(
+  mfcc = audio_ops.mfcc(
       spectrogram, sample_rate, dct_coefficient_count=num_coefficients)
   return mfcc
 
@@ -98,7 +98,7 @@ def ExtractLogMelFeatures(wav_bytes_t):
     p.preemph = 0.97
     p.noise_scale = 0.
     p.pad_end = False
-    return p.cls(p)
+    return p.Instantiate()
 
   sample_rate, audio = DecodeWav(wav_bytes_t)
   audio *= 32768

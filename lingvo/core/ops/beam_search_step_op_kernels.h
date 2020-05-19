@@ -20,9 +20,9 @@ limitations under the License.
 #include <functional>  // std::greater
 #include <vector>
 
+#include "lingvo/core/ops/hyps.pb.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/lib/strings/strcat.h"
-#include "lingvo/core/ops/hyps.pb.h"
 
 namespace tensorflow {
 namespace lingvo {
@@ -230,10 +230,11 @@ class TopK {
 void ComputeTopKPlusM(const std::vector<Hyp>& hyps, const Tensor& scores,
                       const int32 k, const int32 m, const int32 eos_id,
                       const int32 eoc_id, const int32 num_beams,
-                      const float valid_eos_max_logit_delta, bool is_first_step,
+                      const float valid_eos_max_logit_delta,
+                      const float local_eos_threshold, bool is_first_step,
                       bool is_last_decoder_step, const Tensor& is_last_chunk,
                       bool merge_paths, bool allow_empty_terminated_hyp,
-                      std::vector<bool>* eos_in_topk, std::vector<Hyp>* top_k,
+                      std::vector<char>* eos_in_topk, std::vector<Hyp>* top_k,
                       std::vector<Hyp>* extra_m, std::vector<Hyp>* eos_hyps,
                       std::vector<int32>* terminal_symbol);
 

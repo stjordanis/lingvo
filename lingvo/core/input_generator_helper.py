@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,11 +19,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import lingvo.compat as tf
+from lingvo.core import py_utils
 import six
 from six.moves import range
-import tensorflow as tf
-
-from lingvo.core import py_utils
 
 
 def ComputeSplits(batch_size, num_splits):
@@ -47,7 +47,7 @@ def ComputeSplits(batch_size, num_splits):
       tf.div([batch_size], num_splits),
       tf.constant(
           [num_splits], dtype=tf.int32))
-  mods = tf.tile(tf.constant([1]), tf.mod([batch_size], num_splits))
+  mods = tf.tile(tf.constant([1]), tf.math.floormod([batch_size], num_splits))
   zeros = tf.tile(tf.constant([0]),
                   tf.subtract(tf.shape(values), tf.shape(mods)))
   mods = tf.concat([mods, zeros], 0)

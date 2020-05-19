@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,11 +20,9 @@ from __future__ import division
 from __future__ import print_function
 
 import os
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import hyperparams
-from lingvo.core.ops import py_x_ops
+from lingvo.core import ops
 
 
 class MetricHistory(object):
@@ -124,7 +123,7 @@ class MetricHistory(object):
     fname = self._hist_file
     if not self.params.local_filesystem:
       fname += '%r=3.2:sl=8M'
-    with tf.gfile.FastGFile(fname, 'a') as f:
+    with tf.io.gfile.GFile(fname, 'a') as f:
       f.write('%d %f\n' % (global_step, value))
 
 
@@ -146,6 +145,7 @@ class EarlyStop(object):
         'useful if progress is asymptotic.')
     p.Define('window', 0, 'Maximum number of steps between best and current.')
     p.Define('verbose', True, 'Log early-stop checks.')
+    p.Define('min_steps', 0, 'Minimum number of steps before stopping.')
     return p
 
   def __init__(self, params):
@@ -186,9 +186,10 @@ class EarlyStop(object):
     """
     del theta  # not used
     if self.params.window:
-      self._node = py_x_ops.best_step(
-          self.metric_history.hist_file, self.params.tolerance,
-          self.metric_history.minimize, self.metric_history.metric)
+      self._node = ops.best_step(self.metric_history.hist_file,
+                                 self.params.tolerance,
+                                 self.metric_history.minimize,
+                                 self.metric_history.metric)
     else:
       self._node = None
     return self._node
@@ -197,10 +198,13 @@ class EarlyStop(object):
     """Returns true if stop criterion is met."""
     if self.params.window and self._node is not None:
       self._best_step, self._last_step = session.run(self._node)
-      s = self._last_step - self._best_step > self.params.window
+      s = (
+          self._last_step - self._best_step > self.params.window and
+          self._last_step >= self.params.min_steps)
       if self.params.verbose:
-        tf.logging.info('early stop check: best_step=%d, last_step=%d, stop=%d',
-                        self._best_step, self._last_step, s)
+        tf.logging.info(
+            'early stop check: best_step=%d, last_step=%d, stop=%d',
+            self._best_step, self._last_step, s)
       return s
     else:
       return False

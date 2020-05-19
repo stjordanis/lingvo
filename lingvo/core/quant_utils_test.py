@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,18 +18,13 @@
 # pylint: disable=bad-whitespace
 # pylint: disable=bad-continuation
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import numpy as np
-import tensorflow as tf
-
-from tensorflow.python.framework import function
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import py_utils
 from lingvo.core import quant_utils
+from lingvo.core import test_utils
+import numpy as np
 
 
 class SampleQuantizedProjectionLayer(quant_utils.QuantizableLayer):
@@ -97,7 +93,7 @@ class SampleQuantizedProjectionLayer(quant_utils.QuantizableLayer):
     return out
 
 
-class QuantizableLayerTest(tf.test.TestCase):
+class QuantizableLayerTest(test_utils.TestCase):
   # pyformat: disable
   NO_QDOMAIN_EXPECTED = [
    [[ 0.00071405, -0.03868543, -0.01999986, -0.00994987],
@@ -114,7 +110,7 @@ class QuantizableLayerTest(tf.test.TestCase):
     with self.session():
       p = SampleQuantizedProjectionLayer.Params()
       p.name = 'test'
-      l = p.cls(p)
+      l = p.Instantiate()
       l.TrackQTensor('test')
       fns = l.fns
 
@@ -128,29 +124,27 @@ class QuantizableLayerTest(tf.test.TestCase):
         fns.qadd(1, 1, qmin=-1.0)  # Incomplete range args.
       with self.assertRaises(AssertionError):
         fns.qadd(1, 1, qmax=-1.0)  # Incomplete range args.
-      with self.assertRaisesRegexp(AssertionError,
-                                   'first calling TrackQTensor'):
+      with self.assertRaisesRegex(AssertionError, 'first calling TrackQTensor'):
         fns.qadd(1, 1, qt='non_existing')  # Test that qt is resolved.
 
       # Const.
       fns.qtanh(6.0)  # No min/max.
       fns.qtanh(6.0, qmin=-5.0, qmax=6.0)  # Min/max
       fns.qtanh(6.0, qt='test')
-      with self.assertRaisesRegexp(AssertionError,
-                                   'first calling TrackQTensor'):
+      with self.assertRaisesRegex(AssertionError, 'first calling TrackQTensor'):
         fns.qtanh(6.0, qt='non_existing')  # Test that qt has precedence.
 
   def testLayerWithNoQDomain(self):
-    with self.session() as sess:
+    with self.session():
       p = SampleQuantizedProjectionLayer.Params()
-      self._testLayerHelper('testLayerWithNoQDomain', sess, p,
+      self._testLayerHelper('testLayerWithNoQDomain', p,
                             self.NO_QDOMAIN_EXPECTED)
 
   def testLayerWithIdentityQDomain(self):
-    with self.session() as sess:
+    with self.session():
       p = SampleQuantizedProjectionLayer.Params()
       p.qdomain.default = quant_utils.QDomain.Params()
-      self._testLayerHelper('testLayerWithIdentityQDomain', sess, p,
+      self._testLayerHelper('testLayerWithIdentityQDomain', p,
                             self.NO_QDOMAIN_EXPECTED)
 
   def testLayerWithPassiveAsymQDomain(self):
@@ -166,15 +160,15 @@ class QuantizableLayerTest(tf.test.TestCase):
         [ 0.02352941, -0.1490196 , -0.09411764,  0.01568627]]]
     # pyformat: enable
 
-    with self.session() as sess:
+    with self.session():
       p = SampleQuantizedProjectionLayer.Params()
       p.qdomain.default = quant_utils.PassiveAsymQDomain.Params()
       l = self._testLayerHelper(
-          'testLayerWithPassiveAsymQDomain', sess, p, expected=expected)
+          'testLayerWithPassiveAsymQDomain', p, expected=expected)
       init_minmax_vars = l.qdomain_default._qvars.Transform(lambda x: x.eval())
       print('Initial Minmax vars:', init_minmax_vars)
       # Record.
-      sess.run([l.PostTrainingStepUpdate(16)])
+      self.evaluate([l.PostTrainingStepUpdate(16)])
       minmax_vars = l.qdomain_default._qvars.Transform(lambda x: x.eval())
       print('Minmax vars:', minmax_vars)
 
@@ -186,10 +180,9 @@ class QuantizableLayerTest(tf.test.TestCase):
     p = SampleQuantizedProjectionLayer.Params()
     p.qdomain.default = quant_utils.PassiveAsymQDomain.Params()
     p.qdomain.default.delay_start_steps = -1
-    with self.session() as sess:
+    with self.session():
       self._testLayerHelper(
           'testLayerWithPassiveAsymQDomainTrainQuantDisabledInital',
-          sess,
           p,
           expected=self.NO_QDOMAIN_EXPECTED)
 
@@ -197,23 +190,20 @@ class QuantizableLayerTest(tf.test.TestCase):
     p = SampleQuantizedProjectionLayer.Params()
     p.qdomain.default = quant_utils.PassiveAsymQDomain.Params()
     p.qdomain.default.delay_start_steps = -1
-    with self.session() as sess:
+    with self.session():
       self._testLayerHelper(
           'testLayerWithPassiveAsymQDomainTrainQuantDisabledStep16',
-          sess,
           p,
           expected=self.NO_QDOMAIN_EXPECTED,
           global_step=16)
 
   def testLayerWithPassiveAsymQDomainEvalQuantDisabled(self):
-    p = SampleQuantizedProjectionLayer.Params()
-    p.is_eval = True
-    p.qdomain.default = quant_utils.PassiveAsymQDomain.Params()
-    p.qdomain.default.delay_start_steps = -1
-    with self.session() as sess:
+    with self.session(), self.SetEval(True):
+      p = SampleQuantizedProjectionLayer.Params()
+      p.qdomain.default = quant_utils.PassiveAsymQDomain.Params()
+      p.qdomain.default.delay_start_steps = -1
       self._testLayerHelper(
           'testLayerWithPassiveAsymQDomainEvalQuantDisabled',
-          sess,
           p,
           not_expected=self.NO_QDOMAIN_EXPECTED)
 
@@ -221,10 +211,9 @@ class QuantizableLayerTest(tf.test.TestCase):
     p = SampleQuantizedProjectionLayer.Params()
     p.qdomain.default = quant_utils.PassiveAsymQDomain.Params()
     p.qdomain.default.delay_start_steps = 8
-    with self.session() as sess:
+    with self.session():
       self._testLayerHelper(
           'testLayerWithPassiveAsymQDomainTrainQuantDelayNotSatisfied',
-          sess,
           p,
           expected=self.NO_QDOMAIN_EXPECTED,
           global_step=3)
@@ -233,10 +222,9 @@ class QuantizableLayerTest(tf.test.TestCase):
     p = SampleQuantizedProjectionLayer.Params()
     p.qdomain.default = quant_utils.PassiveAsymQDomain.Params()
     p.qdomain.default.delay_start_steps = 8
-    with self.session() as sess:
+    with self.session():
       self._testLayerHelper(
           'testLayerWithPassiveAsymQDomainTrainQuantDelaySatisfied',
-          sess,
           p,
           not_expected=self.NO_QDOMAIN_EXPECTED,
           global_step=8)
@@ -245,15 +233,14 @@ class QuantizableLayerTest(tf.test.TestCase):
     p = SampleQuantizedProjectionLayer.Params()
     p.qdomain.default = quant_utils.PassiveAsymQDomain.Params()
     p.qdomain.default.delay_start_steps = 8
-    with self.session() as sess:
+    with self.session():
       self._testLayerHelper(
           'testLayerWithPassiveAsymQDomainTrainQuantDelaySatisfied',
-          sess,
           p,
           not_expected=self.NO_QDOMAIN_EXPECTED,
           global_step=9)
 
-  def testLayerWithSymetricScheduledClipQDomain(self):
+  def testLayerWithSymmetricScheduledClipQDomain(self):
     # pyformat: disable
     expected = [
        [[ 0.       , -0.0390625, -0.015625 , -0.0078125],
@@ -266,45 +253,43 @@ class QuantizableLayerTest(tf.test.TestCase):
         [ 0.       , -0.125    , -0.0625   ,  0.       ]]]
     # pyformat: enable
 
-    with self.session() as sess:
+    with self.session():
       p = SampleQuantizedProjectionLayer.Params()
-      p.qdomain.default = quant_utils.SymetricScheduledClipQDomain.Params()
+      p.qdomain.default = quant_utils.SymmetricScheduledClipQDomain.Params()
       p.qdomain.default.cc_schedule.Set(
           clip_start_step=0,
           clip_end_step=5,
           quant_start_step=10,
       )
       self._testLayerHelper(
-          'testLayerWithSymetricScheduledClipQDomain',
-          sess,
+          'testLayerWithSymmetricScheduledClipQDomain',
           p,
           expected=expected,
           global_step=16)
 
   def _testLayerHelper(self,
                        test_case,
-                       sess,
                        p,
                        expected=None,
                        not_expected=None,
                        global_step=-1):
-    tf.set_random_seed(398847392)
+    tf.random.set_seed(398847392)
     np.random.seed(12345)
     p.name = 'proj'
     p.input_dim = 3
     p.output_dim = 4
     p.params_init = py_utils.WeightInit.Gaussian(0.1)
-    l = p.cls(p)
+    l = p.Instantiate()
     in_padding = tf.zeros([2, 4, 1], dtype=tf.float32)
     in_padding = tf.constant(
         [[[0], [0], [1], [0]], [[1], [1], [0], [0]]], dtype=tf.float32)
     inputs = tf.constant(
         np.random.normal(0.1, 0.5, [2, 4, 3]), dtype=tf.float32)
     output = l.FPropDefaultTheta(inputs, in_padding)
-    tf.global_variables_initializer().run()
+    self.evaluate(tf.global_variables_initializer())
 
     if global_step >= 0:
-      sess.run([l.PostTrainingStepUpdate(global_step)])
+      self.evaluate(tf.assign(py_utils.GetOrCreateGlobalStepVar(), global_step))
 
     output = output.eval()
     print('QuantizableLayerTest output', test_case, ':\n',
@@ -324,24 +309,16 @@ class ClippingCapScheduleTest(object):
     p.end_step = 100
     p.start_cap = 6.0
     p.end_cap = 1.0
-    cc_schedule = p.cls(p)
+    cc_schedule = p.Instantiate()
     with self.session():
-      print(cc_schedule.Value(25).eval())
-      print(cc_schedule.Value(50).eval())
-      print(cc_schedule.Value(60).eval())
-      print(cc_schedule.Value(70).eval())
-      print(cc_schedule.Value(80).eval())
-      print(cc_schedule.Value(90).eval())
-      print(cc_schedule.Value(100).eval())
-      print(cc_schedule.Value(110).eval())
-      self.assertAllClose(cc_schedule.Value(25).eval(), 6.0)
-      self.assertAllClose(cc_schedule.Value(50).eval(), 6.0)
-      self.assertAllClose(cc_schedule.Value(60).eval(), 5.0)
-      self.assertAllClose(cc_schedule.Value(70).eval(), 4.0)
-      self.assertAllClose(cc_schedule.Value(80).eval(), 3.0)
-      self.assertAllClose(cc_schedule.Value(90).eval(), 2.0)
-      self.assertAllClose(cc_schedule.Value(100).eval(), 1.0)
-      self.assertAllClose(cc_schedule.Value(110).eval(), 1.0)
+      self.assertAllClose(cc_schedule._Value(25).eval(), 6.0)
+      self.assertAllClose(cc_schedule._Value(50).eval(), 6.0)
+      self.assertAllClose(cc_schedule._Value(60).eval(), 5.0)
+      self.assertAllClose(cc_schedule._Value(70).eval(), 4.0)
+      self.assertAllClose(cc_schedule._Value(80).eval(), 3.0)
+      self.assertAllClose(cc_schedule._Value(90).eval(), 2.0)
+      self.assertAllClose(cc_schedule._Value(100).eval(), 1.0)
+      self.assertAllClose(cc_schedule._Value(110).eval(), 1.0)
 
   def _ClipExample(self, cc_schedule, v):
     """Returns a tuple of (neg, pos) for clipped neg/pos values of v."""
@@ -360,17 +337,17 @@ class ClippingCapScheduleTest(object):
     p.quant_start_step = 15
     p.start_cap = 6.0
     p.end_cap = 1.0
-    with self.session() as sess:
-      cc_schedule = p.cls(p)
-      tf.global_variables_initializer().run()
+    with self.session():
+      cc_schedule = p.Instantiate()
+      self.evaluate(tf.global_variables_initializer())
       # Move to fully quantized part of schedule
-      sess.run([cc_schedule.PostTrainingStepUpdate(16)])
+      self.evaluate(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 16))
 
-      @function.Defun(tf.float32, tf.float32)
+      @tf.Defun(tf.float32, tf.float32)
       def ExampleFunction8(x, cc_state):
         return cc_schedule.ApplyClippingWithState(cc_state, x, bits=8)
 
-      @function.Defun(tf.float32, tf.float32)
+      @tf.Defun(tf.float32, tf.float32)
       def ExampleFunction16(x, cc_state):
         return cc_schedule.ApplyClippingWithState(cc_state, x, bits=16)
 
@@ -410,9 +387,9 @@ class ClippingCapScheduleTest(object):
     p.quant_start_step = 15
     p.start_cap = 6.0
     p.end_cap = 1.0
-    with self.session() as sess:
-      cc_schedule = p.cls(p)
-      tf.global_variables_initializer().run()
+    with self.session():
+      cc_schedule = p.Instantiate()
+      self.evaluate(tf.global_variables_initializer())
       # Step 0: No clipping.
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0), (-100.0, 100.0))
@@ -421,7 +398,7 @@ class ClippingCapScheduleTest(object):
           (-0.123456, 0.123456))  # Not Quantized.
 
       # Step 5: Clipping active but not yet quantizing.
-      sess.run([cc_schedule.PostTrainingStepUpdate(5)])
+      self.evaluate(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 5))
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0),
           (-6.0, 5.953125))  # 6 * 127/128
@@ -430,7 +407,7 @@ class ClippingCapScheduleTest(object):
           (-0.123456, 0.123456))  # Not Quantized.
 
       # Step 7: Middle of clipping range.
-      sess.run([cc_schedule.PostTrainingStepUpdate(7)])
+      self.evaluate(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 7))
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0), (-4.0, 3.96875))  # 4 * 127/128
       self.assertAllClose(
@@ -438,7 +415,7 @@ class ClippingCapScheduleTest(object):
           (-0.123456, 0.123456))  # Not Quantized.
 
       # Step 10: End of clipping range.
-      sess.run([cc_schedule.PostTrainingStepUpdate(10)])
+      self.evaluate(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 10))
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0),
           (-1.0, 0.9921875))  # 1 * 127/128
@@ -447,7 +424,7 @@ class ClippingCapScheduleTest(object):
           (-0.123456, 0.123456))  # Not Quantized.
 
       # Step 11: No more clipping but not yet quantizing.
-      sess.run([cc_schedule.PostTrainingStepUpdate(11)])
+      self.evaluate(tf.assign(py_utils.GetOrCreateGlobalStepVar(), 11))
       self.assertAllClose(
           self._ClipExample(cc_schedule, 100.0),
           (-1.0, 0.9921875))  # 1 * 127/128
@@ -457,7 +434,7 @@ class ClippingCapScheduleTest(object):
 
       # Step 15-16: Quantizing at full clip.
       for step in (15, 16):
-        sess.run([cc_schedule.PostTrainingStepUpdate(step)])
+        self.evaluate(tf.assign(py_utils.GetOrCreateGlobalStepVar(), step))
         self.assertAllClose(
             self._ClipExample(cc_schedule, 100.0),
             (-1.0, 0.9921875))  # 1 * 127/128

@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,14 +19,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from six.moves import zip
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import base_model
-from lingvo.core import lr_schedule
 from lingvo.core import py_utils
+from lingvo.core import schedule
 from lingvo.tasks.lm import layers
+from six.moves import zip
 
 
 class LanguageModel(base_model.BaseTask):
@@ -46,8 +46,7 @@ class LanguageModel(base_model.BaseTask):
         'Sum the logP across predicted tokens in batch when set to True; '
         'average across predicted tokens in batch o/w (default).')
 
-    tp.lr_schedule = lr_schedule.PiecewiseConstantLearningRateSchedule.Params(
-    ).Set(
+    tp.lr_schedule = schedule.PiecewiseConstantSchedule.Params().Set(
         boundaries=[350000, 500000, 600000], values=[1.0, 0.1, 0.01, 0.001])
     tp.vn_start_step = 20000
     tp.vn_std = 0.0
@@ -70,6 +69,21 @@ class LanguageModel(base_model.BaseTask):
       # Construct the model.
       self.CreateChild('lm', p.lm)
 
+  @classmethod
+  def UpdateTargetVocabSize(cls, p, vocab_size, wpm_model=None):
+    """Updates the params with the input vocab_size and WPM model.
+
+    Args:
+      p: model params.
+      vocab_size: size of the vocabulary.
+      wpm_model: file name prefix pointing to a wordpiece model.
+
+    Returns:
+      Model params updated with the vocab size and wpm model.
+    """
+    p.lm = p.lm.cls.UpdateTargetVocabSize(p.lm, vocab_size, wpm_model)
+    return p
+
   def _TrimIfPossibleThenTranspose(self, ids, paddings, labels, weights):
     data = (ids, paddings, labels, weights)
     if not py_utils.use_tpu():
@@ -85,7 +99,7 @@ class LanguageModel(base_model.BaseTask):
         input_batch.weights)
 
     batch_size = tf.shape(ids)[1]
-    state0 = self.lm.zero_state(batch_size)
+    state0 = self.lm.zero_state(theta.lm, batch_size)
     labels = py_utils.NestedMap(class_ids=labels_ids, class_weights=weights)
     xent_output, _ = self.lm.FProp(theta.lm, ids, paddings, state0, labels)
 
@@ -145,7 +159,7 @@ class LanguageModel(base_model.BaseTask):
     """Constructs the inference subgraphs.
 
     Returns:
-      {'subgraph_name': (fetches, feeds)}
+      dict: ``{'subgraph_name': (fetches, feeds)}``
     """
     subgraphs = {}
     with tf.name_scope('inference'):
@@ -156,7 +170,7 @@ class LanguageModel(base_model.BaseTask):
     """Default inference subgraph.
 
     Returns:
-      (fetches, feeds), with:
+      (fetches, feeds):
 
       - fetches: A dictionary of fetches, containing:
 
@@ -180,11 +194,13 @@ class LanguageModel(base_model.BaseTask):
     text = tf.placeholder(tf.string, shape=[None])
     # [batch, time]
     ids, labels, paddings = self.input_generator.StringsToIds(text)
-    lengths = tf.reduce_sum(tf.to_int32(1 - paddings), axis=1)
+    lengths = tf.reduce_sum(tf.cast(1 - paddings, tf.int32), axis=1)
     tokens_from_labels = self.input_generator.IdsToStrings(labels, lengths)
     oovs = tf.equal(labels, self.input_generator.tokenizer.unk_id)
-    num_oovs_per_sample = tf.to_int32(
-        tf.reduce_sum(tf.to_float(oovs) * (1 - paddings), axis=1))
+    num_oovs_per_sample = tf.cast(
+        tf.round(
+            tf.reduce_sum(tf.cast(oovs, tf.float32) * (1 - paddings), axis=1)),
+        tf.int32)
     # [time, batch]
     ids, paddings, labels, weights = self._TrimIfPossibleThenTranspose(
         ids, paddings, labels, 1.0 - paddings)
@@ -192,7 +208,7 @@ class LanguageModel(base_model.BaseTask):
     xent_output, _ = self.lm.FPropDefaultTheta(
         inputs=ids,
         paddings=paddings,
-        state0=self.lm.zero_state(batch_size),
+        state0=self.lm.zero_state(self.theta.lm, batch_size),
         labels=py_utils.NestedMap(class_ids=labels, class_weights=weights))
 
     per_example_xent = py_utils.HasShape(xent_output.per_example_xent,
@@ -217,3 +233,14 @@ class LanguageModel(base_model.BaseTask):
     }
     feeds = {'text': text}
     return fetches, feeds
+
+
+class FixedShapeInputLanguageModel(LanguageModel):
+
+  def _TrimIfPossibleThenTranspose(self, ids, paddings, labels, weights):
+    data = (ids, paddings, labels, weights)
+    if not py_utils.use_tpu() and self.do_eval:
+      max_seq_len = tf.cast(
+          tf.reduce_max(tf.reduce_sum(1.0 - paddings, 1)), tf.int32)
+      data = (x[:, :max_seq_len] for x in data)
+    return (tf.transpose(x) for x in data)

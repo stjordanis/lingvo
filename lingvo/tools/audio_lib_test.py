@@ -1,3 +1,4 @@
+# Lint as: python3
 # -*- coding: utf-8 -*-
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
@@ -15,15 +16,10 @@
 # ==============================================================================
 """Tests for audio_lib."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import os
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import test_helper
+from lingvo.core import test_utils
 from lingvo.tools import audio_lib
 
 # The testdata contains: (soxi .../gan_or_vae.wav)
@@ -33,22 +29,22 @@ from lingvo.tools import audio_lib
 # Duration       : 00:00:03.16 = 75900 samples ~ 237.188 CDDA sectors
 
 
-class AudioLibTest(tf.test.TestCase):
+class AudioLibTest(test_utils.TestCase):
 
   def testDecodeFlacToWav(self):
     with open(
         test_helper.test_src_dir_path('tools/testdata/gan_or_vae.wav'),
-        'r') as f:
+        'rb') as f:
       wav = f.read()
     with open(
         test_helper.test_src_dir_path('tools/testdata/gan_or_vae.flac'),
-        'r') as f:
+        'rb') as f:
       flac = f.read()
     tf.logging.info('flac: %d bytes', len(flac))
     try:
       converted = audio_lib.DecodeFlacToWav(flac)
       tf.logging.info('wav: %d bytes, converted: %d bytes', len(wav),
-                      len(converted))
+                           len(converted))
       self.assertEqual(wav, converted)
     except OSError:
       # sox is not installed, ignore this test.
@@ -57,37 +53,37 @@ class AudioLibTest(tf.test.TestCase):
   def testDecodeWav(self):
     with open(
         test_helper.test_src_dir_path('tools/testdata/gan_or_vae.wav'),
-        'r') as f:
+        'rb') as f:
       wav = f.read()
-    with self.session() as sess:
-      sample_rate, audio = sess.run(audio_lib.DecodeWav(wav))
+    with self.session():
+      sample_rate, audio = self.evaluate(audio_lib.DecodeWav(wav))
       self.assertEqual(24000, sample_rate)
       self.assertEqual(75900, len(audio))
 
   def testAudioToMfcc(self):
     with open(
         test_helper.test_src_dir_path('tools/testdata/gan_or_vae.wav'),
-        'r') as f:
+        'rb') as f:
       wav = f.read()
     sample_rate, audio = audio_lib.DecodeWav(wav)
     static_sample_rate = 24000
     mfcc = audio_lib.AudioToMfcc(static_sample_rate, audio, 32, 25, 40)
-    with self.session() as sess:
-      audio_sample_rate, mfcc = sess.run([sample_rate, mfcc])
+    with self.session():
+      audio_sample_rate, mfcc = self.evaluate([sample_rate, mfcc])
       assert audio_sample_rate == static_sample_rate
       self.assertAllEqual(mfcc.shape, [1, 126, 40])
 
   def testExtractLogMelFeatures(self):
     with open(
         test_helper.test_src_dir_path('tools/testdata/gan_or_vae.16k.wav'),
-        'r') as f:
+        'rb') as f:
       wav = f.read()
 
     wav_bytes_t = tf.constant(wav, dtype=tf.string)
     log_mel_t = audio_lib.ExtractLogMelFeatures(wav_bytes_t)
 
-    with self.session() as sess:
-      log_mel = sess.run(log_mel_t)
+    with self.session():
+      log_mel = self.evaluate(log_mel_t)
       # Expect 314, 80 dimensional channels.
       self.assertAllEqual(log_mel.shape, [1, 314, 80, 1])
 

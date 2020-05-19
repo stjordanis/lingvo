@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,8 +24,8 @@ from __future__ import division
 from __future__ import print_function
 
 import inspect
-
-import tensorflow as tf
+from lingvo import model_imports
+import lingvo.compat as tf
 from lingvo.core import base_model_params
 
 tf.flags.DEFINE_string(
@@ -53,20 +54,22 @@ def _MaybeUpdateParamsFromFlags(cfg):
 
   if FLAGS.model_params_override:
     params_override = FLAGS.model_params_override.replace(';', '\n')
-    tf.logging.info('Applying params overrides:\n%s\nTo:\n%s', params_override,
-                    cfg.ToText())
+    tf.logging.info('Applying params overrides:\n%s\nTo:\n%s',
+                         params_override, cfg.ToText())
     cfg.FromText(params_override)
   if (FLAGS.model_params_file_override and
-      tf.gfile.Exists(FLAGS.model_params_file_override)):
-    params_override = tf.gfile.FastGFile(FLAGS.model_params_file_override,
-                                         'r').read()
+      tf.io.gfile.exists(FLAGS.model_params_file_override)):
+    params_override = tf.io.gfile.GFile(FLAGS.model_params_file_override,
+                                        'r').read()
     tf.logging.info('Applying params overrides from file %s:\n%s\nTo:\n%s',
-                    FLAGS.model_params_file_override, params_override,
-                    cfg.ToText())
+                         FLAGS.model_params_file_override, params_override,
+                         cfg.ToText())
     cfg.FromText(params_override)
 
 
 class _ModelRegistryHelper(object):
+  _MODEL_PARAMS_ALLOW_REDEF = False
+
   # Global dictionary mapping subclass name to registered ModelParam subclass.
   _MODEL_PARAMS = {}
   # Global set of modules from which ModelParam subclasses have been registered.
@@ -92,14 +95,11 @@ class _ModelRegistryHelper(object):
     path_prefix = cls._ClassPathPrefix()
     path = path.replace(path_prefix, '')
 
-    # Removes '.params' if exists.
-    if '.params' not in path:
-      # Sometimes, we define a param class in a unittest.
-      if not inspect.getfile(src_cls).endswith('test.py'):
-        raise ValueError('Model params being registered must be '
-                         'in a params subfolder or a test.')
+    # Removes 'params.' if exists.
+    if 'params.' in path:
+      path = path.replace('params.', '')
+    if inspect.getfile(src_cls).endswith('test.py'):
       return 'test.{}'.format(src_cls.__name__)
-    path = path.replace('.params', '')
     return '{}.{}'.format(path, src_cls.__name__)
 
   @classmethod
@@ -114,7 +114,7 @@ class _ModelRegistryHelper(object):
     """Registers a ModelParams subclass in the global registry."""
     key = cls._ModelParamsClassKey(src_cls)
     module = src_cls.__module__
-    if key in cls._MODEL_PARAMS:
+    if not cls._MODEL_PARAMS_ALLOW_REDEF and key in cls._MODEL_PARAMS:
       raise ValueError('Duplicate model registered for key {}: {}.{}'.format(
           key, module, src_cls.__name__))
 
@@ -140,15 +140,20 @@ class _ModelRegistryHelper(object):
     # When the python3 super() is used, it should be possible to return this
     # from the decorators too.
 
+    registered_source_info = cls._GetSourceInfo(src_cls)
+
     class Registered(src_cls):
-      REGISTERED_SOURCE_INFO = cls._GetSourceInfo(src_cls)
+      """Registered model wrapper."""
+
+      @property
+      def _registered_source_info(self):
+        return registered_source_info
 
       # Extend model to annotate source information.
-      @classmethod
-      def Model(cls):
+      def Model(self):
         """Wraps BaseTask params into SingleTaskModel params."""
-        p = super(Registered, cls).Model()
-        p.model = cls.REGISTERED_SOURCE_INFO
+        p = super(Registered, self).Model()
+        p.model = self._registered_source_info
         return p
 
     # So things show up in messages well.
@@ -159,8 +164,8 @@ class _ModelRegistryHelper(object):
   def RegisterSingleTaskModel(cls, src_cls):
     """Class decorator that registers a `.SingleTaskModelParams` subclass."""
     if not issubclass(src_cls, base_model_params.SingleTaskModelParams):
-      raise TypeError(
-          'src_cls %s is not a SingleTaskModelParams!' % src_cls.__name__)
+      raise TypeError('src_cls %s is not a SingleTaskModelParams!' %
+                      src_cls.__name__)
     cls._RegisterModel(cls._CreateWrapperClass(src_cls), src_cls)
     return src_cls
 
@@ -168,8 +173,8 @@ class _ModelRegistryHelper(object):
   def RegisterMultiTaskModel(cls, src_cls):
     """Class decorator that registers a `.MultiTaskModelParams` subclass."""
     if not issubclass(src_cls, base_model_params.MultiTaskModelParams):
-      raise TypeError(
-          'src_cls %s is not a MultiTaskModelParams!' % src_cls.__name__)
+      raise TypeError('src_cls %s is not a MultiTaskModelParams!' %
+                      src_cls.__name__)
     cls._RegisterModel(cls._CreateWrapperClass(src_cls), src_cls)
     return src_cls
 
@@ -196,8 +201,10 @@ class _ModelRegistryHelper(object):
     """
     all_params = cls.GetAllRegisteredClasses()
     if class_key not in all_params:
-      raise LookupError('Model %s not found. Known models:\n%s' %
-                        (class_key, '\n'.join(sorted(all_params.keys()))))
+      for k in sorted(all_params):
+        tf.logging.info('Known model: %s', k)
+      raise LookupError('Model %s not found from list of above known models.' %
+                        class_key)
     return all_params[class_key]
 
   @classmethod
@@ -215,19 +222,52 @@ class _ModelRegistryHelper(object):
       Full `~.hyperparams.Params` for the model class.
     """
     model_params_cls = cls.GetClass(class_key)
-    cfg = model_params_cls.Model()
-    cfg.input = model_params_cls.GetDatasetParams(dataset_name)
+    model_params = model_params_cls()
+    cfg = model_params.Model()
+    cfg.input = model_params.GetDatasetParams(dataset_name)
 
     _MaybeUpdateParamsFromFlags(cfg)
     return cfg
+
+  @classmethod
+  def GetProgramSchedule(cls, class_key):
+    """Retrieve the ProgramSchedule and a dict of task params.
+
+    Args:
+      class_key: String class key (i.e. `image.mnist.LeNet5`).
+
+    Returns:
+      ProgramSchedule.Params()
+    """
+    model_params_cls = cls.GetClass(class_key)
+    model_params = model_params_cls()
+    program_schedule_cfg = model_params.ProgramSchedule()
+    return program_schedule_cfg
 
 
 # pyformat: disable
 # pylint: disable=invalid-name
 RegisterSingleTaskModel = _ModelRegistryHelper.RegisterSingleTaskModel
 RegisterMultiTaskModel = _ModelRegistryHelper.RegisterMultiTaskModel
-GetAllRegisteredClasses = _ModelRegistryHelper.GetAllRegisteredClasses
-GetClass = _ModelRegistryHelper.GetClass
-GetParams = _ModelRegistryHelper.GetParams
 # pylint: enable=invalid-name
 # pyformat: enable
+
+
+def GetAllRegisteredClasses():
+  model_imports.ImportAllParams()
+  return _ModelRegistryHelper.GetAllRegisteredClasses()
+
+
+def GetClass(class_key):
+  model_imports.ImportParams(class_key)
+  return _ModelRegistryHelper.GetClass(class_key)
+
+
+def GetParams(class_key, dataset_name):
+  model_imports.ImportParams(class_key)
+  return _ModelRegistryHelper.GetParams(class_key, dataset_name)
+
+
+def GetProgramSchedule(class_key):
+  model_imports.ImportParams(class_key)
+  return _ModelRegistryHelper.GetProgramSchedule(class_key)

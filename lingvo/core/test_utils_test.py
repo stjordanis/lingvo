@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +15,12 @@
 # ==============================================================================
 """Tests for test_utils."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import tensorflow as tf
+import lingvo.compat as tf
 from lingvo.core import test_utils
 
 
-class TestUtilsTest(tf.test.TestCase):
+class TestUtilsTest(test_utils.TestCase):
 
   def testReplaceGoldenSingleFloat(self):
     old_line = '      CompareToGoldenSingleFloat(self, 1.489712, vs[0])\n'

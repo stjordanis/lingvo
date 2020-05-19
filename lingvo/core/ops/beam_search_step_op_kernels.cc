@@ -14,13 +14,16 @@ limitations under the License.
 ==============================================================================*/
 
 #include "lingvo/core/ops/beam_search_step_op_kernels.h"
+
+#include <cmath>
+
+#include "lingvo/core/ops/hyps.pb.h"
+#include "lingvo/core/ops/simple_vocab.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/util/work_sharder.h"
-#include "lingvo/core/ops/hyps.pb.h"
-#include "lingvo/core/ops/simple_vocab.h"
 
 namespace tensorflow {
 namespace lingvo {
@@ -76,7 +79,7 @@ bool IsDuplicateHyp(const Hyp& cur_hyp, const Hyp& other_hyp,
 
 float LogSumExp(float a, float b) {
   const float m = std::max(a, b);
-  return m + log(exp(a - m) + exp(b - m));
+  return m + std::log(std::exp(a - m) + std::exp(b - m));
 }
 
 #ifdef __AVX__
@@ -103,10 +106,14 @@ bool all_less_than(const float* p, float threshold) {
 void ComputeTopKPlusM(const std::vector<Hyp>& hyps, const Tensor& scores,
                       const int32 k, const int32 m, const int32 eos_id,
                       const int32 eoc_id, const int32 num_beams,
-                      const float valid_eos_max_logit_delta, bool is_first_step,
+                      const float valid_eos_max_logit_delta,
+                      const float local_eos_threshold, bool is_first_step,
                       bool is_last_decoder_step, const Tensor& is_last_chunk,
                       bool merge_paths, bool allow_empty_terminated_hyp,
-                      std::vector<bool>* eos_in_topk, std::vector<Hyp>* top_k,
+                      // Note that this is functionally a bool, however
+                      // vector<bool> is not safe to parallel write into
+                      // since it's underlying storage is at the byte-level.
+                      std::vector<char>* eos_in_topk, std::vector<Hyp>* top_k,
                       std::vector<Hyp>* extra_m, std::vector<Hyp>* eos_hyps,
                       std::vector<int32>* terminal_syms) {
   VLOG(1) << "Topk clear, num_beams: " << num_beams;
@@ -205,7 +212,8 @@ void ComputeTopKPlusM(const std::vector<Hyp>& hyps, const Tensor& scores,
                         << " toks=" << debug::IdsToStr(e.prev_ids);
                 // We move terminated hyps off of the beam.
                 if (is_last_decoder_step ||
-                    (e.global_score > eos_score_threshold)) {
+                    (e.global_score > eos_score_threshold &&
+                    e.local_score > local_eos_threshold)) {
                   (*eos_in_topk)[hyp_id] = true;
                   (*eos_hyps)[hyp_id] = e;
                   (*terminal_syms)[hyp_id] = eos_id;
@@ -236,7 +244,7 @@ void ComputeTopKPlusM(const std::vector<Hyp>& hyps, const Tensor& scores,
       });
 
   const int hyps_per_beam = k;
-  top_k->resize(num_beams * hyps_per_beam);
+  top_k->resize(hyps_per_beam * num_beams);
   for (int i = 0; i < num_beams; ++i) {
     auto ith_topk = merged_topk_vec[i].Get();
     std::sort(ith_topk.begin(), ith_topk.end(), HigherScore());
@@ -261,6 +269,8 @@ class BeamSearchStepOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("num_hyps_per_beam", &num_hyps_per_beam_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("valid_eos_max_logit_delta",
                                      &valid_eos_max_logit_delta_));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("local_eos_threshold",
+                                     &local_eos_threshold_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("merge_paths", &merge_paths_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("allow_empty_terminated_hyp",
                                      &allow_empty_terminated_hyp_));
@@ -291,7 +301,7 @@ class BeamSearchStepOp : public OpKernel {
                  input_data.size());
         }
       } else if (input.dtype() == DT_STRING) {
-        output->flat<string>() = input.flat<string>();
+        output->flat<tstring>() = input.flat<tstring>();
       }
     }
     return output;
@@ -532,15 +542,17 @@ class BeamSearchStepOp : public OpKernel {
     std::vector<Hyp> top_k_hyps;
     std::vector<Hyp> extra_m_hyps;
     std::vector<Hyp> eos_hyps;
-    std::vector<bool> eos_in_topk;
+    std::vector<char> eos_in_topk;
     std::vector<int32> terminal_syms;
     const bool is_last_decoder_step =
         (t == (in_hyps.dim_size(0) - 1)) && force_eos_in_last_step_;
-    ComputeTopKPlusM(hyps, scores, num_hyps_per_beam_, 0, eos_id_, eoc_id_,
-                     num_beams, valid_eos_max_logit_delta_, t == 0,
-                     is_last_decoder_step, is_last_chunk, merge_paths_,
-                     allow_empty_terminated_hyp_, &eos_in_topk, &top_k_hyps,
-                     &extra_m_hyps, &eos_hyps, &terminal_syms);
+    ComputeTopKPlusM(hyps, scores, /*k=*/num_hyps_per_beam_, /*m=*/0,
+                     /*eos_id=*/eos_id_, /*eoc_id=*/eoc_id_, num_beams,
+                     valid_eos_max_logit_delta_, local_eos_threshold_,
+                     /*is_first_step=*/t == 0, is_last_decoder_step,
+                     is_last_chunk, merge_paths_, allow_empty_terminated_hyp_,
+                     &eos_in_topk, &top_k_hyps, &extra_m_hyps, &eos_hyps,
+                     &terminal_syms);
 
     Tensor* out_best_scores = NULL;
     Tensor* out_cumulative_scores = NULL;
@@ -561,7 +573,7 @@ class BeamSearchStepOp : public OpKernel {
     auto t_out_scores = out_scores->matrix<float>();
     auto t_out_hyps = out_hyps->matrix<int>();
     auto t_out_prev_hyps = out_prev_hyps->matrix<int>();
-    auto t_out_done_hyps = out_done_hyps->matrix<string>();
+    auto t_out_done_hyps = out_done_hyps->matrix<tstring>();
     auto t_out_atten_probs = out_atten_probs->tensor<float, 3>();
     auto t_all_done = all_done->scalar<bool>();
 
@@ -641,6 +653,7 @@ class BeamSearchStepOp : public OpKernel {
   float beam_size_ = 0.0;
   int num_hyps_per_beam_ = 0;
   float valid_eos_max_logit_delta_ = 0.0;
+  float local_eos_threshold_ = 0.0;
   bool merge_paths_ = false;
   bool allow_empty_terminated_hyp_ = true;
   bool ensure_full_beam_ = false;
@@ -687,7 +700,7 @@ class TopKTerminatedHypsOp : public OpKernel {
                      k, /* unused epsilon id */ -1));
     // Each mutex is used to protect corresponding topk_vec.
     std::vector<mutex> mu_vec(num_beams);
-    auto t_done_hyps = in_done_hyps.matrix<string>();
+    auto t_done_hyps = in_done_hyps.matrix<tstring>();
     // The thread sharding is along hyps_size.
     Shard(kNumWorkers, workers, hyps_size, 1000 * num_steps,
           [&](int64 start, int64 limit) {
@@ -718,7 +731,7 @@ class TopKTerminatedHypsOp : public OpKernel {
             }
           });
 
-    auto t_topk_hyps = topk_hyps->matrix<string>();
+    auto t_topk_hyps = topk_hyps->matrix<tstring>();
     for (int i = 0; i < num_beams; ++i) {
       auto ith_topk = topk_vec[i].Get();
       CHECK_LE(ith_topk.size(), k);
@@ -735,19 +748,20 @@ class TopKTerminatedHypsOp : public OpKernel {
                         const int src_size) const {
     int length = hypothesis.atten_vecs_size();
     Tensor cumulative_atten_prob(DT_FLOAT, {src_size});
-    cumulative_atten_prob.flat<float>().setZero();
+    auto cumulative_atten_prob_vec = cumulative_atten_prob.vec<float>();
+    cumulative_atten_prob_vec.setZero();
     for (int step = 0; step < hypothesis.atten_vecs_size(); ++step) {
       const int hyp_prob_size = hypothesis.atten_vecs(step).prob_size();
       for (int src_id = 0; src_id < src_size; ++src_id) {
         if (src_id < hyp_prob_size) {
-          cumulative_atten_prob.flat<float>()(src_id) +=
+          cumulative_atten_prob_vec(src_id) +=
               hypothesis.atten_vecs(step).prob(src_id);
         } else {
           // This can happen e.g. for RNNT model. Here we simply assume
           // atten_prob for those source positions are 0.0
           VLOG(5) << "Missing atten_prob for source position " << src_id
                   << ". Total available positions are " << hyp_prob_size << ".";
-          cumulative_atten_prob.flat<float>()(src_id) += 0.0;
+          cumulative_atten_prob_vec(src_id) += 0.0;
         }
       }
     }
@@ -755,14 +769,14 @@ class TopKTerminatedHypsOp : public OpKernel {
     // reasonably covered, it is not penalized anymore.
     Tensor penalty(DT_FLOAT, {});
     penalty.scalar<float>() =
-        (cumulative_atten_prob.flat<float>() / target_seq_length_ratio_)
+        (cumulative_atten_prob_vec / target_seq_length_ratio_)
             .cwiseMax(0.001f)
             .cwiseMin(0.5f)
             .log()
-            .sum();
+            .sum().eval();
     const float coverage_penalty = penalty.scalar<float>()();
-    const float length_norm = pow(length + 5.0, length_normalization_) /
-                              pow(5.0, length_normalization_);
+    const float length_norm = std::pow(length + 5.0, length_normalization_) /
+                              std::pow(5.0, length_normalization_);
 
     float global_score = 0.0;
     for (const auto& score : hypothesis.scores()) {
@@ -787,7 +801,7 @@ class TopKTerminatedHypsOp : public OpKernel {
         ctx, in_src_seq_lens.dim_size(0) == num_beams,
         errors::InvalidArgument(
             "src_seq_lengths should be a 1-d Tensor of length num_beams. Got ",
-            in_src_seq_lens.dims(), " vs ", num_beams));
+            in_src_seq_lens.dim_size(0), " vs ", num_beams));
     std::vector<int32> src_seq_lengths(num_beams);
     for (int i = 0; i < num_beams; ++i) {
       src_seq_lengths[i] = in_src_seq_lens.flat<int>()(i);
@@ -822,13 +836,14 @@ class UnpackHypOp : public OpKernel {
 
   void Compute(OpKernelContext* ctx) override {
     const Tensor& in_hyps = ctx->input(0);
-    const auto& t_in_hyps = in_hyps.flat<string>();
+    const auto& t_in_hyps = in_hyps.flat<tstring>();
     const int batch_size = t_in_hyps.size();
     std::vector<Hypothesis> hyps(batch_size);
     for (int i = 0; i < batch_size; ++i) {
       // TODO(yonghui): parallelize this loop.
+      const tstring& t_in_hyps_i = t_in_hyps(i);
       if (!t_in_hyps(i).empty()) {
-        hyps[i].ParseFromString(t_in_hyps(i));
+        hyps[i].ParseFromArray(t_in_hyps_i.data(), t_in_hyps_i.size());
       }
     }
     int max_seq_length = max_seq_length_;
@@ -977,7 +992,7 @@ class HypsFromBeamSearchOuts : public OpKernel {
 
     Tensor* out_hyps;
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, hyps.shape(), &out_hyps));
-    auto out_hyps_t = out_hyps->matrix<string>();
+    auto out_hyps_t = out_hyps->matrix<tstring>();
 
     // Use the same thread pool as topk operator.
     static thread::ThreadPool* workers =

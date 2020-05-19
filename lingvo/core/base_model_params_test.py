@@ -14,30 +14,28 @@
 # ==============================================================================
 """Tests for base_model_params."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
-import tensorflow as tf
+import lingvo.compat as tf
 from lingvo.core import base_model_params
+from lingvo.core import test_utils
 
 
-class BaseModelParamsTest(tf.test.TestCase):
+class BaseModelParamsTest(test_utils.TestCase):
 
   def testGetDatasetParams_SingleTaskModelParams(self):
-    dummy_model = base_model_params.SingleTaskModelParams
+    dummy_model = base_model_params.SingleTaskModelParams()
     self.assertEqual(dummy_model.Train(), dummy_model.GetDatasetParams('Train'))
     self.assertEqual(dummy_model.Dev(), dummy_model.GetDatasetParams('Dev'))
     self.assertEqual(dummy_model.Test(), dummy_model.GetDatasetParams('Test'))
-    with self.assertRaises(AttributeError):
+    with self.assertRaises(base_model_params.DatasetError):
       dummy_model.GetDatasetParams('Invalid')
 
   def testGetDatasetParams_MultiTaskModelParams(self):
-    dummy_model = base_model_params.MultiTaskModelParams
+    dummy_model = base_model_params.MultiTaskModelParams()
     self.assertEqual(dummy_model.Train(), dummy_model.GetDatasetParams('Train'))
     self.assertEqual(dummy_model.Dev(), dummy_model.GetDatasetParams('Dev'))
     self.assertEqual(dummy_model.Test(), dummy_model.GetDatasetParams('Test'))
-    with self.assertRaises(AttributeError):
+    with self.assertRaises(base_model_params.DatasetError):
       dummy_model.GetDatasetParams('Invalid')
 
 

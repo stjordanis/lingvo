@@ -4,6 +4,7 @@ load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 load(
     "//lingvo:repo.bzl",
     "cc_tf_configure",
+    "icu",
     "lingvo_protoc_deps",
     "lingvo_testonly_deps",
 )
@@ -11,7 +12,7 @@ load(
 git_repository(
     name = "subpar",
     remote = "https://github.com/google/subpar",
-    tag = "1.3.0",
+    tag = "2.0.0",
 )
 
 cc_tf_configure()
@@ -19,3 +20,5 @@ cc_tf_configure()
 lingvo_testonly_deps()
 
 lingvo_protoc_deps()
+
+icu()

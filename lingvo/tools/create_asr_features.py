@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,16 +19,13 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
 import os
 import random
 import re
-
 import tarfile
-
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.tools import audio_lib
+from six.moves import range
 
 tf.flags.DEFINE_string('input_tarball', '', 'Input .tar.gz file.')
 tf.flags.DEFINE_string('input_text', '', 'Reference text.')
@@ -107,7 +105,7 @@ def _ReadTranscriptions():
     f = tar.extractfile(tarinfo)
     u = 0
     for l in f.readlines():
-      uttid, txt = l.strip('\n').split(' ', 1)
+      uttid, txt = l.strip(b'\n').split(b' ', 1)
       trans[uttid] = txt
       u += 1
     tf.logging.info('[%s] = %d utterances', key, u)
@@ -142,7 +140,7 @@ def _MakeLogMelFromTensorflowBuiltin(tf_wav_bytes):
 
 def _OpenSubShards():
   tf.logging.info('Shards: %d to %d', FLAGS.output_range_begin,
-                  FLAGS.output_range_end)
+                       FLAGS.output_range_end)
   recordio_writers = []
   for s in range(FLAGS.output_range_begin, FLAGS.output_range_end):
     filepath = FLAGS.output_template % (s, FLAGS.num_output_shards)
@@ -175,7 +173,7 @@ def _CreateAsrFeatures():
   tar = tarfile.open(FLAGS.input_tarball, mode='r:gz')
   n = 0
   recordio_writers = _OpenSubShards()
-  tfconf = tf.ConfigProto()
+  tfconf = tf.config_pb2.ConfigProto()
   tfconf.gpu_options.allow_growth = True
   with tf.Session(config=tfconf) as sess:
     for tarinfo in tar:
@@ -192,7 +190,7 @@ def _CreateAsrFeatures():
       assert uttid in trans, uttid
       num_words = len(trans[uttid])
       tf.logging.info('utt[%d]: %s [%d frames, %d words]', n, uttid,
-                      frames.shape[1], num_words)
+                           frames.shape[1], num_words)
       ex = _MakeTfExample(uttid, frames, trans[uttid])
       outf = _SelectRandomShard(recordio_writers)
       outf.write(ex.SerializeToString())

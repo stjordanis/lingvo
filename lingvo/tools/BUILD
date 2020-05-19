@@ -1,75 +1,123 @@
+load(
+    "//lingvo:lingvo.bzl",
+    "lingvo_cc_binary",
+)
+
 package(
     default_visibility = ["//visibility:public"],
 )
 
 licenses(["notice"])  # Apache 2.0
 
-load(
-    "//lingvo:lingvo.bzl",
-    "lingvo_cc_binary",
+py_binary(
+    name = "gke_launch",
+    srcs = ["gke_launch.py"],
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
+    deps = [
+        # Implicit absl.app dependency.
+        # Implicit absl.flags dependency.
+        # Implicit six dependency.
+        # Implicit yaml dependency.
+    ],
 )
 
 py_binary(
     name = "keras2ckpt",
     srcs = ["keras2ckpt.py"],
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
     ],
 )
 
 py_binary(
     name = "bpe_word_tokenizer",
     srcs = ["bpe_word_tokenizer.py"],
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
+        # Implicit six dependency.
     ],
 )
 
 py_binary(
     name = "wpm_encode_file",
     srcs = ["wpm_encode_file.py"],
-    deps = [":wpm_encode_file_main_lib"],
-)
-
-py_library(
-    name = "wpm_encode_file_main_lib",
-    srcs = ["wpm_encode_file.py"],
-    deps = [":wpm_encode_file_lib"],
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
+    deps = [
+        ":wpm_encode_file_lib",
+        # Implicit six dependency.
+    ],
 )
 
 py_library(
     name = "wpm_encode_file_lib",
     srcs = ["wpm_encode_file.py"],
+    srcs_version = "PY2AND3",
     deps = [
-        # Implicit numpy dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:wpm_encoder",
+        # Implicit numpy dependency.
+        # Implicit six dependency.
     ],
 )
 
 py_binary(
     name = "print_tf_records",
     srcs = ["print_tf_records.py"],
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
+        # Implicit six dependency.
     ],
 )
 
 py_binary(
     name = "compute_stats",
     srcs = ["compute_stats.py"],
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
+        # Implicit numpy dependency.
+        # Implicit six dependency.
     ],
 )
 
 py_library(
     name = "audio_lib",
     srcs = ["audio_lib.py"],
+    srcs_version = "PY2AND3",
     deps = [
         # Additional FFT kernels dependency.
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
+        "//lingvo/core:py_utils",
         "//lingvo/tasks/asr:frontend",
+    ],
+)
+
+py_library(
+    name = "beam_utils",
+    srcs = ["beam_utils.py"],
+    srcs_version = "PY2AND3",
+)
+
+py_test(
+    name = "beam_utils_test",
+    srcs = ["beam_utils_test.py"],
+    data = ["//lingvo/tasks/mt/testdata:wmt14_ende_tfexample"],
+    python_version = "PY3",
+    deps = [
+        ":beam_utils",
+        # Implicit apache_beam dependency.
+        "//lingvo:compat",
+        "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
     ],
 )
 
@@ -79,19 +127,47 @@ py_test(
     data = [
         "//lingvo/tools/testdata:audio_data",
     ],
+    python_version = "PY3",
     deps = [
         ":audio_lib",
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo/core:test_helper",
+        "//lingvo/core:test_utils",
+    ],
+)
+
+py_library(
+    name = "compare_params_lib",
+    srcs = ["compare_params.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        "//lingvo:compat",
+        "//lingvo:model_registry",
+        # Implicit six dependency.
+    ],
+)
+
+py_test(
+    name = "compare_params_test",
+    srcs = ["compare_params_test.py"],
+    python_version = "PY3",
+    deps = [
+        ":compare_params_lib",
+        "//lingvo:compat",
+        "//lingvo/core:hyperparams",
+        "//lingvo/core:test_utils",
     ],
 )
 
 py_binary(
     name = "create_asr_features",
     srcs = ["create_asr_features.py"],
+    python_version = "PY3",
+    srcs_version = "PY2AND3",
     deps = [
         ":audio_lib",
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
+        # Implicit six dependency.
     ],
 )
 
@@ -100,7 +176,7 @@ lingvo_cc_binary(
     srcs = ["generate_proto_def.cc"],
     deps = [
         # Implicit proto dependency.
-        # Implicit tensorflow proto dependency.
+        # Implicit tensorflow C++ proto dependency.
     ],
 )
 

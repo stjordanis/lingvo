@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,12 +19,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_input_generator
 from lingvo.core import base_layer
 from lingvo.core import base_model
 from lingvo.core import py_utils
+from lingvo.core import summary_utils
 
 
 class CountingInputGenerator(base_input_generator.BaseInputGenerator):
@@ -55,10 +56,10 @@ class CountingInputGenerator(base_input_generator.BaseInputGenerator):
     super(CountingInputGenerator, self).__init__(params)
     self.shape = params.shape
 
-  def InputBatch(self):
+  def _InputBatch(self):
     length = tf.reduce_prod(self.shape)
-    counter = base_model.StatsCounter('CountingInputGenerator')
-    new_value = tf.cast(counter.IncBy(None, length), dtype=tf.int32) - length
+    counter = summary_utils.StatsCounter('CountingInputGenerator')
+    new_value = tf.cast(counter.IncBy(length), dtype=tf.int32) - length
     new_value = tf.stop_gradient(new_value)
     values = new_value + tf.range(length)
     shaped_values = tf.reshape(tf.cast(values, dtype=tf.float32), self.shape)
@@ -87,7 +88,7 @@ class IdentityRegressionTask(base_model.BaseTask):
     """sum(m * x) + b."""
     return tf.reduce_sum(theta.m * input_batch.src_ids, axis=1) + theta.b
 
-  def ComputeLoss(self, theta, input_batch, predicted):
+  def ComputeLoss(self, theta, predicted, input_batch):
     diff = predicted - input_batch.tgt_ids
     per_example_loss = diff * diff
     batch_dim = py_utils.GetShape(per_example_loss)[0]

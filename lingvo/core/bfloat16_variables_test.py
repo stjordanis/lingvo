@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,16 +15,14 @@
 # ==============================================================================
 """Tests for bfloat16_variables."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import os
-import tensorflow as tf
+import lingvo.compat as tf
 from lingvo.core import bfloat16_variables
+from lingvo.core import test_utils
 
 
-class Bfloat16VariablesTest(tf.test.TestCase):
+class Bfloat16VariablesTest(test_utils.TestCase):
 
   def testBfloat16Reload(self):
     checkpoint_path = os.path.join(self.get_temp_dir(), "bfloat16_restore")
@@ -33,7 +32,7 @@ class Bfloat16VariablesTest(tf.test.TestCase):
     fl = 0.99
     with self.session(graph=g_for_save_graph) as sess:
       v0 = tf.Variable(fl, name="v0", dtype=tf.float32, use_resource=True)
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
       self.assertAlmostEqual(fl, v0.eval())
 
       saver = tf.train.Saver({
@@ -46,7 +45,7 @@ class Bfloat16VariablesTest(tf.test.TestCase):
     g_for_restore_graph = tf.Graph()
     with self.session(graph=g_for_restore_graph) as sess:
       v0 = tf.Variable(0.0, name="v0", dtype=tf.bfloat16, use_resource=True)
-      tf.global_variables_initializer().run()
+      self.evaluate(tf.global_variables_initializer())
       self.assertAlmostEqual(0.0, v0.eval())
       saveable = bfloat16_variables.Bfloat16VariableSaveable(
           v0, tf.float32, "", "v0")

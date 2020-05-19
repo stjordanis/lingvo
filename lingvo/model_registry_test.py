@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,16 +15,13 @@
 # ==============================================================================
 """Tests for model_registry."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-import tensorflow as tf
 
 from lingvo import model_registry
+import lingvo.compat as tf
 from lingvo.core import base_input_generator
 from lingvo.core import base_model
 from lingvo.core import base_model_params
+from lingvo.core import test_utils
 
 FLAGS = tf.flags.FLAGS
 
@@ -31,38 +29,36 @@ FLAGS = tf.flags.FLAGS
 @model_registry.RegisterSingleTaskModel
 class DummyModel(base_model_params.SingleTaskModelParams):
 
-  @classmethod
-  def Train(cls):
+  def Train(self):
     p = base_input_generator.BaseInputGenerator.Params()
     p.name = 'Train'
     return p
 
-  @classmethod
-  def Dev(cls):
+  def Dev(self):
     p = base_input_generator.BaseInputGenerator.Params()
     p.name = 'Dev'
     return p
 
-  @classmethod
-  def Test(cls):
+  def Test(self):
     p = base_input_generator.BaseInputGenerator.Params()
     p.name = 'Test'
     return p
 
-  @classmethod
-  def Task(cls):
+  def Task(self):
     p = base_model.BaseTask.Params()
+    p.name = 'DummyModel'
     return p
 
 
-class ModelRegistryTest(tf.test.TestCase):
+class ModelRegistryTest(test_utils.TestCase):
 
   def setUp(self):
     FLAGS.model_params_override = ''
 
   def testGetClass(self):
 
-    mp = model_registry.GetClass('test.DummyModel')
+    mp_cls = model_registry.GetClass('test.DummyModel')
+    mp = mp_cls()
     self.assertEqual('Train', mp.Train().name)
     self.assertEqual('Dev', mp.Dev().name)
     self.assertEqual('Test', mp.Test().name)
@@ -76,17 +72,17 @@ class ModelRegistryTest(tf.test.TestCase):
   def testGetParams(self):
     cfg = model_registry.GetParams('test.DummyModel', 'Test')
     self.assertIsNotNone(cfg)
-    self.assertEqual(DummyModel.Test(), cfg.input)
+    self.assertEqual(DummyModel().Test(), cfg.input)
     cfg.input = None
     # Registered version adds model source info but direct does not.
     cfg.model = None
-    self.assertEqual(DummyModel.Model(), cfg)
+    self.assertEqual(DummyModel().Model(), cfg)
 
     with self.assertRaises(LookupError):
       # Not yet registered.
       cfg = model_registry.GetParams('something.does.not.exist', 'Test')
 
-    with self.assertRaises(AttributeError):
+    with self.assertRaises(base_model_params.DatasetError):
       cfg = model_registry.GetParams('test.DummyModel', 'UnknownDataset')
 
   def testGetParamsCanOverrideWithFlags(self):
@@ -109,6 +105,11 @@ class ModelRegistryTest(tf.test.TestCase):
   def testGetParamsCanOverrideWithFlagsRaises(self):
     FLAGS.model_params_override = 'task.SOME_UNKNOWN_PARAM : 10'
     with self.assertRaises(AttributeError):
+      _ = model_registry.GetParams('test.DummyModel', 'Train')
+
+  def testGetParamsCanOverrideWithFlagsBadSyntax(self):
+    FLAGS.model_params_override = 'task.SOME_UNKNOWN_PARAM=10'
+    with self.assertRaises(ValueError):
       _ = model_registry.GetParams('test.DummyModel', 'Train')
 
   def testGetParamsCanOverrideInputParamsWithFlags(self):

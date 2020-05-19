@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,7 +39,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow as tf
+import lingvo.compat as tf
+import six
+from six.moves import map
 
 tf.flags.DEFINE_string('encoded_filepath', '',
                        'Path to the BPE encoded corpus file.')
@@ -95,7 +98,7 @@ def main(_):
   vocab = _GetVocabulary(FLAGS.vocab_filepath)
   word_tokenization = _ExtractTokenization(FLAGS.encoded_filepath, vocab)
   with open(FLAGS.output_filepath, 'w') as output:
-    for word, ids in word_tokenization.iteritems():
+    for word, ids in six.iteritems(word_tokenization):
       output.write(word + ' ')
       output.write(','.join(map(str, ids)))
       output.write('\r\n')

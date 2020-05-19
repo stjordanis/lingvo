@@ -13,10 +13,12 @@ py_library(
     name = "codelab",
     srcs = ["codelab.py"],
     data = [":brown_corpus_wpm_data"],
+    srcs_version = "PY2AND3",
     deps = [
-        # Implicit tensorflow dependency.
+        "//lingvo:compat",
         "//lingvo:model_registry",
         "//lingvo/core:base_model_params",
+        "//lingvo/tasks/mt:base_config",
         "//lingvo/tasks/mt/params",
         "//lingvo/tasks/punctuator:input_generator",
         "//lingvo/tasks/punctuator:model",
@@ -25,7 +27,9 @@ py_library(
 
 py_library(
     name = "params",
-    srcs = ["__init__.py"],
+    srcs = ["params.py"],
+    srcs_version = "PY2AND3",
+    tags = ["keep_dep"],
     deps = [
         ":codelab",
     ],

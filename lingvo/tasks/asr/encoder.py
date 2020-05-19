@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,31 +19,34 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-from six.moves import range
-from six.moves import zip
-import tensorflow as tf
-
-from tensorflow.python.ops import inplace_ops
-from lingvo.core import base_encoder
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import layers
 from lingvo.core import model_helper
-from lingvo.core import plot
 from lingvo.core import py_utils
 from lingvo.core import rnn_cell
 from lingvo.core import rnn_layers
+from lingvo.core import spectrum_augmenter
 from lingvo.core import summary_utils
+from six.moves import range
+from six.moves import zip
+
+from tensorflow.python.ops import inplace_ops
 
 ConvLSTMBlock = collections.namedtuple('ConvLSTMBlock', ('rnn', 'cnn'))
 
 
-class AsrEncoder(base_encoder.BaseEncoder):
+class AsrEncoder(base_layer.BaseLayer):
   """Speech encoder version 1."""
 
   @classmethod
   def Params(cls):
     """Configs for AsrEncoder."""
     p = super(AsrEncoder, cls).Params()
+    p.Define('specaugment_network',
+             spectrum_augmenter.SpectrumAugmenter.Params(),
+             'Configs template for the augmentation network.')
+    p.Define('use_specaugment', False, 'Use specaugmentation or not.')
     p.Define('lstm_tpl', rnn_cell.LSTMCellSimple.Params(),
              'Configs template for the RNN layer.')
     p.Define('cnn_tpl', layers.ConvLayer.Params(),
@@ -78,16 +82,21 @@ class AsrEncoder(base_encoder.BaseEncoder):
         'Disabled if 0 or greater than num_lstm_layers.')
     p.Define('residual_stride', 1,
              'Number of lstm layers to skip per residual connection.')
-    p.Define(
-        'bidi_rnn_type', 'func', 'Options: func, native_cudnn. '
-        'func: BidirectionalFRNN, '
-        'native_cudnn: BidirectionalNativeCuDNNLSTM.')
+    p.Define('bidi_rnn_type', 'func', 'Options: func. '
+             'func: BidirectionalFRNN. ')
     p.Define(
         'extra_per_layer_outputs', False,
         'Whether to output the encoding result from each encoder layer besides '
         'the regular final output. The corresponding extra outputs are keyed '
         'by "${layer_type}_${layer_index}" in the encoder output NestedMap, '
         'where layer_type is one of: "conv", "conv_lstm" and "rnn".')
+    p.Define('stacking_layer_tpl', layers.StackingOverTime.Params(),
+             'Configs template for the stacking layer over time.')
+    p.Define(
+        'layer_index_before_stacking', -1,
+        'The (0-based) index of the lstm layer after which the stacking layer '
+        'will be inserted. Negative value means no stacking layer will be '
+        'used.')
 
     # TODO(yonghui): Maybe move those configs to a separate file.
     # Set some reasonable default values.
@@ -131,17 +140,22 @@ class AsrEncoder(base_encoder.BaseEncoder):
     p.after_conv_lstm_cnn_tpl.params_init = (
         py_utils.WeightInit.TruncatedGaussian(0.1))
     p.after_conv_lstm_cnn_tpl.filter_stride = [1, 1]
+
+    # See https://arxiv.org/pdf/1610.03022.pdf, section 2.2.
+    p.proj_tpl.batch_norm = True
+    p.proj_tpl.activation = 'RELU'
     return p
 
   @base_layer.initializer
   def __init__(self, params):
     super(AsrEncoder, self).__init__(params)
     p = self.params
-    assert not p.packed_input, ('Packed inputs are not yet supported for '
-                                'AsrEncoder.')
     name = p.name
 
     with tf.variable_scope(name):
+      # Use specAugment or not.
+      if p.use_specaugment:
+        self.CreateChild('specaugment', p.specaugment_network.Copy())
       # First create the conv layers.
 
       assert p.num_cnn_layers == len(p.conv_filter_shapes)
@@ -152,7 +166,6 @@ class AsrEncoder(base_encoder.BaseEncoder):
         conv_p.name = 'conv_L%d' % (i)
         conv_p.filter_shape = p.conv_filter_shapes[i]
         conv_p.filter_stride = p.conv_filter_strides[i]
-        conv_p.is_eval = p.is_eval
         params_conv_layers.append(conv_p)
       self.CreateChildren('conv', params_conv_layers)
 
@@ -196,11 +209,9 @@ class AsrEncoder(base_encoder.BaseEncoder):
       params_rnn_layers = []
       params_proj_layers = []
       params_highway_skip_layers = []
+      output_dim = self._first_lstm_input_dim
       for i in range(p.num_lstm_layers):
-        if i == 0:
-          input_dim = self._first_lstm_input_dim
-        else:
-          input_dim = 2 * p.lstm_cell_size
+        input_dim = output_dim
         forward_p = p.lstm_tpl.Copy()
         forward_p.name = 'fwd_rnn_L%d' % (i)
         forward_p.num_input_nodes = input_dim
@@ -210,13 +221,13 @@ class AsrEncoder(base_encoder.BaseEncoder):
         rnn_p = self.CreateBidirectionalRNNParams(forward_p, backward_p)
         rnn_p.name = 'brnn_L%d' % (i)
         params_rnn_layers.append(rnn_p)
+        output_dim = 2 * p.lstm_cell_size
 
         if p.project_lstm_output and (i < p.num_lstm_layers - 1):
           proj_p = p.proj_tpl.Copy()
           proj_p.input_dim = 2 * p.lstm_cell_size
           proj_p.output_dim = 2 * p.lstm_cell_size
           proj_p.name = 'proj_L%d' % (i)
-          proj_p.is_eval = p.is_eval
           params_proj_layers.append(proj_p)
 
         # add the skip layers
@@ -226,6 +237,16 @@ class AsrEncoder(base_encoder.BaseEncoder):
           highway_skip.name = 'enc_hwskip_%d' % len(params_highway_skip_layers)
           highway_skip.input_dim = 2 * p.lstm_cell_size
           params_highway_skip_layers.append(highway_skip)
+        # Adds the stacking layer.
+        if p.layer_index_before_stacking == i:
+          stacking_layer = p.stacking_layer_tpl.Copy()
+          stacking_layer.name = 'stacking_%d' % (i)
+          self.CreateChild('stacking', stacking_layer)
+          stacking_window_len = (
+              p.stacking_layer_tpl.left_context + 1 +
+              p.stacking_layer_tpl.right_context)
+          output_dim *= stacking_window_len
+
       self.CreateChildren('rnn', params_rnn_layers)
       self.CreateChildren('proj', params_proj_layers)
       self.CreateChildren('highway_skip', params_highway_skip_layers)
@@ -233,6 +254,10 @@ class AsrEncoder(base_encoder.BaseEncoder):
   @property
   def _use_functional(self):
     return True
+
+  @property
+  def input_shape(self):
+    return self.params.input_shape
 
   def CreateBidirectionalRNNParams(self, forward_p, backward_p):
     return model_helper.CreateBidirectionalRNNParams(self.params, forward_p,
@@ -265,7 +290,7 @@ class AsrEncoder(base_encoder.BaseEncoder):
   def supports_streaming(self):
     return False
 
-  def zero_state(self, batch_size):
+  def zero_state(self, theta, batch_size):
     return py_utils.NestedMap()
 
   def FProp(self, theta, batch, state0=None):
@@ -283,7 +308,7 @@ class AsrEncoder(base_encoder.BaseEncoder):
       state0: Recurrent input state. Not supported/ignored by this encoder.
 
     Returns:
-      A NestedMap containing:
+      A NestedMap containing
 
       - 'encoded': a feature tensor of shape [time, batch, depth]
       - 'padding': a 0/1 tensor of shape [time, batch]
@@ -297,6 +322,10 @@ class AsrEncoder(base_encoder.BaseEncoder):
     inputs, paddings = batch.src_inputs, batch.paddings
     outputs = py_utils.NestedMap()
     with tf.name_scope(p.name):
+      # Adding specAugmentation.
+      if p.use_specaugment and not self.do_eval:
+        inputs, paddings = self.specaugment.FProp(theta.specaugment, inputs,
+                                                  paddings)
       # Add a few extra padded timesteps at the end. This is for ensuring the
       # correctness of the conv-layers at the edges.
       if p.pad_steps > 0:
@@ -312,17 +341,8 @@ class AsrEncoder(base_encoder.BaseEncoder):
         inputs = tf.concat([inputs, inputs_pad], 1, name='inputs')
         paddings = tf.concat([paddings, paddings_pad], 1)
 
-      def ReshapeForPlot(tensor, padding, name):
-        """Transposes and flattens channels to [batch, dim, seq_len] shape."""
-        # Flatten any dimensions beyond the third into the third.
-        batch_size = tf.shape(tensor)[0]
-        max_len = tf.shape(tensor)[1]
-        plot_tensor = tf.reshape(tensor, [batch_size, max_len, -1])
-        plot_tensor = tf.transpose(plot_tensor, [0, 2, 1], name=name)
-        return (plot_tensor, summary_utils.SequenceLength(padding))
-
       plots = [
-          ReshapeForPlot(
+          summary_utils.PrepareSequenceForPlot(
               tf.transpose(inputs, [0, 1, 3, 2]), paddings, 'inputs')
       ]
 
@@ -337,7 +357,7 @@ class AsrEncoder(base_encoder.BaseEncoder):
               encoded=tf.transpose(conv_out, [1, 0, 2, 3]),  # to [t, b, d, c]
               padding=tf.transpose(out_padding))
         plots.append(
-            ReshapeForPlot(
+            summary_utils.PrepareSequenceForPlot(
                 tf.transpose(conv_out, [0, 1, 3, 2]), out_padding,
                 'conv_%d_out' % i))
 
@@ -377,8 +397,9 @@ class AsrEncoder(base_encoder.BaseEncoder):
                                    [1, 0, 2, 3]),  # to [t, b, d, c]
               padding=tf.transpose(conv_lstm_out_padding))
         plots.append(
-            ReshapeForPlot(conv_lstm_out, conv_lstm_out_padding,
-                           'conv_lstm_%d_out' % i))
+            summary_utils.PrepareSequenceForPlot(conv_lstm_out,
+                                                 conv_lstm_out_padding,
+                                                 'conv_lstm_%d_out' % i))
 
       # Need to do a reshape before starting the rnn layers.
       conv_lstm_out = py_utils.HasRank(conv_lstm_out, 4)
@@ -425,26 +446,25 @@ class AsrEncoder(base_encoder.BaseEncoder):
           rnn_out *= (1.0 - rnn_padding)
           outputs['rnn_%d' % i] = py_utils.NestedMap(
               encoded=rnn_out, padding=tf.squeeze(rnn_padding, [2]))
+        # Stacking layer connection.
+        if p.layer_index_before_stacking == i:
+          # Stacking layer expects input tensor shape as [batch, time, feature].
+          # So transpose the tensors before and after the layer.
+          rnn_out, rnn_padding = self.stacking.FProp(
+              tf.transpose(rnn_out, [1, 0, 2]),
+              tf.transpose(rnn_padding, [1, 0, 2]))
+          rnn_out = tf.transpose(rnn_out, [1, 0, 2])
+          rnn_padding = tf.transpose(rnn_padding, [1, 0, 2])
+
         plots.append(
-            ReshapeForPlot(
+            summary_utils.PrepareSequenceForPlot(
                 tf.transpose(rnn_out, [1, 0, 2]),
                 tf.transpose(rnn_padding, [1, 0, 2]), 'rnn_%d_out' % i))
         rnn_in = rnn_out
       final_out = rnn_in
 
-      if self.cluster.add_summary:
-        fig = plot.MatplotlibFigureSummary(
-            'encoder_example', figsize=(8, len(plots) * 3.5))
-
-        # Order layers from bottom to top.
-        plots.reverse()
-        for tensor, seq_len in plots:
-          fig.AddSubplot(
-              [tensor, seq_len],
-              summary_utils.TrimPaddingAndPlotSequence,
-              title=tensor.name,
-              xlabel='Time')
-        fig.Finalize()
+      summary_utils.PlotSequenceFeatures(
+          list(reversed(plots)), 'encoder_example', xlabel='Time')
 
       outputs['encoded'] = final_out
       outputs['padding'] = tf.squeeze(rnn_padding, [2])

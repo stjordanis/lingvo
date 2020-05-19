@@ -1,4 +1,4 @@
-package(default_visibility = ["//lingvo/tasks/mt:__pkg__"])
+package(default_visibility = ["//visibility:public"])
 
 licenses(["notice"])  # Apache 2.0
 
@@ -9,5 +9,20 @@ filegroup(
     data = [
         "wmt14_ende_wpm_32k_test.tfrecord",
         "wmt14_ende_wpm_32k_test.vocab",
+    ],
+)
+
+filegroup(
+    name = "mlperf_tfexample",
+    data = [
+        "translate_ende_mlperf.packed.tfrecord",
+        "translate_ende_wmt32k-train-00511-of-00512",
+    ],
+)
+
+filegroup(
+    name = "en_fr",
+    data = [
+        "en_fr.tfrecord",
     ],
 )

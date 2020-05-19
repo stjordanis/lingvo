@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,12 +18,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from six.moves import range
-import tensorflow as tf
-
+import lingvo.compat as tf
 from lingvo.core import base_layer
 from lingvo.core import layers
 from lingvo.core import layers_with_attention
+from six.moves import range
 
 
 class TransformerStack(base_layer.BaseLayer):
@@ -42,8 +42,10 @@ class TransformerStack(base_layer.BaseLayer):
     # Transformer related
     p.Define('model_dim', 1024, 'Characteristic depth (dimension).')
     p.Define('num_transformer_layers', 6, 'Number of transformer layers.')
-    p.Define('transformer_tpl', layers_with_attention.TransformerLayer.Params(),
-             'TransformerLayer params tpl.')
+    p.Define(
+        'transformer_tpl', layers_with_attention.TransformerLayer.Params(),
+        'TransformerLayer params tpl. Can be a list of params. '
+        'num_transformer_layers should be divisible by len(transformer_tpl).')
 
     p.Define('ln_tpl', layers.LayerNorm.Params(), 'Layer norm default params')
     p.Define('ln_output', False,
@@ -61,6 +63,7 @@ class TransformerStack(base_layer.BaseLayer):
              'If True, assumes multiple training samples per input.')
     p.Define('has_aux_attention', False,
              'Allows encoder layers to attend auxiliary inputs.')
+    p.Define('mask_self_atten', False, 'If True, use masked self-attention.')
     p.transformer_tpl.tr_atten_tpl.num_attention_heads = 8
     p.transformer_tpl.tr_fflayer_tpl.hidden_dim = 8192
     return p
@@ -73,13 +76,25 @@ class TransformerStack(base_layer.BaseLayer):
     with tf.variable_scope(p.name):
       # Add transformer layers.
       transformer_layer_params = []
-      for i in range(p.num_transformer_layers):
-        params = p.transformer_tpl.Copy()
+      denom = 1
+      if isinstance(p.transformer_tpl, list):
+        denom = len(p.transformer_tpl)
+        assert p.num_transformer_layers % len(p.transformer_tpl) == 0
+      for i in range(p.num_transformer_layers // denom):
+        if isinstance(p.transformer_tpl, list):
+          for q in p.transformer_tpl:
+            params = q.Copy()
+            transformer_layer_params.append(params)
+        else:
+          params = p.transformer_tpl.Copy()
+          transformer_layer_params.append(params)
+
+      for i, params in enumerate(transformer_layer_params):
         params.name = 'trans_%d' % (i)
         params.source_dim = p.model_dim
         params.packed_input = p.packed_input
         params.has_aux_atten = p.has_aux_attention
-        transformer_layer_params.append(params)
+        params.mask_self_atten = p.mask_self_atten
 
       self.CreateChildren('trans', transformer_layer_params)
 
@@ -98,7 +113,7 @@ class TransformerStack(base_layer.BaseLayer):
         for i in range(p.num_transparent_outputs):
           transparent_param = p.transparent_merger_tpl.Copy()
           transparent_param.name = 'transparent_%d' % i
-          transparent_param.num_sources = 1 + p.num_transformer_layers
+          transparent_param.num_sources = 1 + len(transformer_layer_params)
           transparent_params.append(transparent_param)
         self.CreateChildren('transparent_merger', transparent_params)
 
@@ -132,8 +147,8 @@ class TransformerStack(base_layer.BaseLayer):
       (outputs, out_paddings, segment_ids) tuple. `outputs` is of the shape
       [time, batch, depth], and `out_paddings` has shape [time, batch]. If
       is_transparent is True, can return a list of num_transformer_layers
-      tensors of shape [time, batch, depth] if `p.is_eval` is False, and a
-      [time, batch, depth, num_transparent_outputs] tensor if `p.is_eval` is
+      tensors of shape [time, batch, depth] if `self.do_eval` is False, and a
+      [time, batch, depth, num_transparent_outputs] tensor if `self.do_eval` is
       True. If packed_input is True, also returns segment_id, otherwise returns
       None.
     """
@@ -175,7 +190,7 @@ class TransformerStack(base_layer.BaseLayer):
             merged_outputs = self.transparent_merger[i].FProp(
                 theta.transparent_merger[i], outputs_list)
             transformer_output.append(merged_outputs)
-          if p.is_eval:
+          if self.do_eval:
             transformer_output = tf.stack(transformer_output, 3)
 
       return transformer_output, paddings, src_segment_id

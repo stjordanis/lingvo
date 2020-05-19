@@ -13,9 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <algorithm>
-
 #include "lingvo/core/ops/weighted_mix_record_yielder.h"
+
+#include <algorithm>
 
 namespace tensorflow {
 namespace lingvo {
@@ -63,7 +63,7 @@ void WeightedMixRecordYielder::Close() {
   delete this;
 }
 
-Status WeightedMixRecordYielder::Yield(Rope* value) {
+Status WeightedMixRecordYielder::Yield(Record* record) {
   size_t yielder_idx = 0;
   {
     MutexLock l(&mu_);
@@ -74,7 +74,7 @@ Status WeightedMixRecordYielder::Yield(Rope* value) {
     // Retry indefinitely until we get an Ok status from the specific yielder.
     // This will stall the training if there is any unrecoverable error with
     // the child yielder.
-    Status s = yielders_.at(yielder_idx)->Yield(value);
+    Status s = yielders_.at(yielder_idx)->Yield(record);
     if (!s.ok()) {
       LOG(WARNING) << s;
       continue;

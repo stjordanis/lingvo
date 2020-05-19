@@ -1,3 +1,4 @@
+# Lint as: python2, python3
 # Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,9 +19,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import lingvo.compat as tf
 import six
-
-import tensorflow as tf
 
 tf.flags.DEFINE_string('input_filepattern', '',
                        'File pattern of binary tfrecord files.')
@@ -51,7 +51,9 @@ def _CustomShortDebugString(tf_example):
   for name, value in sorted(six.iteritems(tf_example.features.feature)):
     if value.HasField('bytes_list'):
       if FLAGS.bytes_as_utf8:
-        utf8_values = [v.decode('utf-8') for v in value.bytes_list.value]
+        utf8_values = [
+            six.ensure_text(v, 'utf-8') for v in value.bytes_list.value
+        ]
         value_string = _ListDebugString(utf8_values)
       else:
         value_string = _ListDebugString(value.bytes_list.value)
@@ -81,7 +83,7 @@ def _PrintHeader(tf_example):
 
 def _PrintFiles():
   entry = 0
-  for filepath in tf.gfile.Glob(FLAGS.input_filepattern):
+  for filepath in tf.io.gfile.glob(FLAGS.input_filepattern):
     records = tf.compat.v1.io.tf_record_iterator(filepath)
     for serialized in records:
       if entry < FLAGS.skip_first_n:

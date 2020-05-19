@@ -16,7 +16,7 @@
 
 set -eu
 
-. ./lingvo/tasks/asr/tools/librispeech_lib.sh
+. librispeech_lib.sh
 
 mkdir -p "${ROOT}/train"
 
@@ -28,7 +28,7 @@ mkdir -p "${ROOT}/train"
 # This takes about 10 minutes per set.
 for subset in train-clean-100 train-clean-360 train-other-500; do
   echo "=== First pass, collecting transcripts: ${subset}"
-  bazel-bin/lingvo/tools/create_asr_features --logtostderr \
+  python3 -m lingvo.tools.create_asr_features --logtostderr \
     --input_tarball="${ROOT}/raw/${subset}.tar.gz" --dump_transcripts \
     --transcripts_filepath="${ROOT}/train/${subset}.txt"
 done
@@ -50,7 +50,7 @@ subset=train-clean-100
 echo "=== Second pass, parameterization: ${subset}"
 for subshard in $(seq 0 9); do
   set -x
-  nice -n 20 bazel-bin/lingvo/tools/create_asr_features \
+  nice -n 20 python3 -m lingvo.tools.create_asr_features \
     --logtostderr \
     --input_tarball="${ROOT}/raw/${subset}.tar.gz" --generate_tfrecords \
     --transcripts_filepath="${ROOT}/train/${subset}.txt" \
@@ -66,7 +66,7 @@ subset=train-clean-360
 echo "=== Second pass, parameterization: ${subset}"
 for subshard in $(seq 0 9); do
   set -x
-  nice -n 20 bazel-bin/lingvo/tools/create_asr_features \
+  nice -n 20 python3 -m lingvo.tools.create_asr_features \
     --logtostderr \
     --input_tarball="${ROOT}/raw/${subset}.tar.gz" --generate_tfrecords \
     --transcripts_filepath="${ROOT}/train/${subset}.txt" \
@@ -83,7 +83,7 @@ subset=train-other-500
 echo "=== Second pass, parameterization: ${subset}"
 for subshard in $(seq 0 9); do
   set -x
-  nice -n 20 bazel-bin/lingvo/tools/create_asr_features \
+  nice -n 20 python3 -m lingvo.tools.create_asr_features \
     --logtostderr \
     --input_tarball="${ROOT}/raw/${subset}.tar.gz" --generate_tfrecords \
     --transcripts_filepath="${ROOT}/train/${subset}.txt" \
